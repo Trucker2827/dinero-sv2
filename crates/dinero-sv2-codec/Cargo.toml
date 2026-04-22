@@ -1,0 +1,17 @@
+[package]
+name        = "dinero-sv2-codec"
+version     = { workspace = true }
+edition     = { workspace = true }
+license     = { workspace = true }
+repository  = { workspace = true }
+authors     = { workspace = true }
+rust-version = { workspace = true }
+description = "Dinero Stratum V2 profile — fixed-size wire codec"
+
+[dependencies]
+dinero-sv2-common = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+hex      = { workspace = true }

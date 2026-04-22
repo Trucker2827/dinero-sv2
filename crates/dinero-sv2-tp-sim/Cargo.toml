@@ -1,0 +1,23 @@
+[package]
+name        = "dinero-sv2-tp-sim"
+version     = { workspace = true }
+edition     = { workspace = true }
+license     = { workspace = true }
+repository  = { workspace = true }
+authors     = { workspace = true }
+rust-version = { workspace = true }
+description = "Phase-1 Template Provider simulator for Dinero Stratum V2"
+
+[[bin]]
+name = "dinero-sv2-tp-sim"
+path = "src/main.rs"
+
+[dependencies]
+dinero-sv2-common = { workspace = true }
+dinero-sv2-codec  = { workspace = true }
+anyhow    = { workspace = true }
+hex       = { workspace = true }
+tokio     = { workspace = true }
+clap      = { workspace = true }
+tracing   = { workspace = true }
+tracing-subscriber = { workspace = true }
