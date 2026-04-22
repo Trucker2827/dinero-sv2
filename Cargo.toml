@@ -35,6 +35,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 reqwest    = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 base64     = "0.22"
 async-trait = "0.1"
+snow       = "0.9"
+rand       = "0.8"
 
 [profile.release]
 lto = "thin"

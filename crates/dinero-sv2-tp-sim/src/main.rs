@@ -25,10 +25,12 @@ use dinero_sv2_codec::{
 };
 use dinero_sv2_common::{HeaderAssembly, NewTemplateDinero};
 use dinero_sv2_transport::{
-    read_frame, write_frame, ACK_BAD_SHAPE, ACK_OK, ACK_UNDER_TARGET, MSG_NEW_TEMPLATE,
+    NoiseSession, StaticKeys, ACK_BAD_SHAPE, ACK_OK, ACK_UNDER_TARGET, MSG_NEW_TEMPLATE,
     MSG_SHARE_ACK, MSG_SUBMIT_SHARES,
 };
-use tokio::net::{TcpListener, TcpStream};
+use std::path::PathBuf;
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
@@ -48,18 +50,46 @@ struct Args {
     /// 0 means accept everything that decodes cleanly.
     #[arg(long, default_value_t = 0)]
     leading_zero_bits: u8,
+
+    /// Static Noise identity file. 64 bytes: `priv[0..32] || pub[32..64]`.
+    /// Defaults to `/tmp/dinero-sv2-tp-sim.key` (ephemeral, just for demos).
+    #[arg(long)]
+    tp_key: Option<PathBuf>,
+
+    /// Print the sim's static public key (hex) and exit.
+    #[arg(long)]
+    print_pubkey: bool,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let args = Args::parse();
+
+    let key_path = args
+        .tp_key
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("/tmp/dinero-sv2-tp-sim.key"));
+    let static_keys = StaticKeys::load_or_generate(&key_path)
+        .with_context(|| format!("loading key from {}", key_path.display()))?;
+
+    if args.print_pubkey {
+        println!("{}", static_keys.public_hex());
+        return Ok(());
+    }
+
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "dinero_sv2_tp_sim=info".into()),
         )
         .init();
+    info!(
+        key = %key_path.display(),
+        pubkey = %static_keys.public_hex(),
+        "tp-sim static identity"
+    );
 
-    let args = Args::parse();
     let listener = TcpListener::bind(args.bind)
         .await
         .with_context(|| format!("binding {}", args.bind))?;
@@ -87,9 +117,18 @@ async fn main() -> Result<()> {
         let (sock, peer) = listener.accept().await?;
         let rx = rx.clone();
         let leading = args.leading_zero_bits;
+        let keys = static_keys.clone();
         tokio::spawn(async move {
-            info!(peer = %peer, "client connected");
-            if let Err(e) = serve_client(sock, rx, leading).await {
+            info!(peer = %peer, "client connected — handshake starting");
+            let session = match NoiseSession::accept_nx(sock, &keys).await {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(peer = %peer, error = %e, "noise handshake failed");
+                    return;
+                }
+            };
+            info!(peer = %peer, "noise handshake complete");
+            if let Err(e) = serve_client(session, rx, leading).await {
                 warn!(peer = %peer, error = %e, "client session ended with error");
             } else {
                 info!(peer = %peer, "client disconnected");
@@ -126,17 +165,16 @@ fn splat_array(seed: [u8; 2]) -> [u8; 32] {
     out
 }
 
-async fn serve_client(
-    mut sock: TcpStream,
+async fn serve_client<S: AsyncRead + AsyncWrite + Unpin>(
+    mut session: NoiseSession<S>,
     mut rx: watch::Receiver<Option<NewTemplateDinero>>,
     leading: u8,
 ) -> Result<()> {
     let mut current: Option<NewTemplateDinero> = None;
 
-    // Deliver the current template immediately on connect if one exists.
     let initial = rx.borrow_and_update().clone();
     if let Some(t) = initial {
-        send_template(&mut sock, &t).await?;
+        send_template(&mut session, &t).await?;
         current = Some(t);
     }
 
@@ -150,19 +188,19 @@ async fn serve_client(
                 }
                 let maybe_t = rx.borrow_and_update().clone();
                 if let Some(t) = maybe_t {
-                    send_template(&mut sock, &t).await?;
+                    send_template(&mut session, &t).await?;
                     current = Some(t);
                 }
             }
 
-            frame = read_frame(&mut sock) => {
+            frame = session.read_frame() => {
                 let (msg_type, payload) = match frame? {
                     Some(f) => f,
-                    None => return Ok(()), // clean EOF
+                    None => return Ok(()),
                 };
                 match msg_type {
                     MSG_SUBMIT_SHARES => {
-                        handle_submit_shares(&mut sock, &payload, current.as_ref(), leading).await?;
+                        handle_submit_shares(&mut session, &payload, current.as_ref(), leading).await?;
                     }
                     other => warn!(msg_type = other, "unexpected msg from client"),
                 }
@@ -171,15 +209,18 @@ async fn serve_client(
     }
 }
 
-async fn send_template(sock: &mut TcpStream, tmpl: &NewTemplateDinero) -> Result<()> {
+async fn send_template<S: AsyncRead + AsyncWrite + Unpin>(
+    session: &mut NoiseSession<S>,
+    tmpl: &NewTemplateDinero,
+) -> Result<()> {
     let payload = encode_new_template(tmpl);
-    write_frame(sock, MSG_NEW_TEMPLATE, &payload).await?;
+    session.write_frame(MSG_NEW_TEMPLATE, &payload).await?;
     debug!(id = tmpl.template_id, "sent template");
     Ok(())
 }
 
-async fn handle_submit_shares(
-    sock: &mut TcpStream,
+async fn handle_submit_shares<S: AsyncRead + AsyncWrite + Unpin>(
+    session: &mut NoiseSession<S>,
     payload: &[u8],
     current: Option<&NewTemplateDinero>,
     leading: u8,
@@ -188,13 +229,13 @@ async fn handle_submit_shares(
         Ok(s) => s,
         Err(e) => {
             warn!(error = %e, "bad share shape");
-            write_frame(sock, MSG_SHARE_ACK, &[ACK_BAD_SHAPE]).await?;
+            session.write_frame(MSG_SHARE_ACK, &[ACK_BAD_SHAPE]).await?;
             return Ok(());
         }
     };
     let Some(tmpl) = current else {
         warn!("share received before any template was sent");
-        write_frame(sock, MSG_SHARE_ACK, &[ACK_BAD_SHAPE]).await?;
+        session.write_frame(MSG_SHARE_ACK, &[ACK_BAD_SHAPE]).await?;
         return Ok(());
     };
     let hash = HeaderAssembly::hash(tmpl, &share);
@@ -206,14 +247,16 @@ async fn handle_submit_shares(
             nonce = share.nonce,
             "accepted share"
         );
-        write_frame(sock, MSG_SHARE_ACK, &[ACK_OK]).await?;
+        session.write_frame(MSG_SHARE_ACK, &[ACK_OK]).await?;
     } else {
         debug!(
             hash = %hex::encode(hash),
             leading,
             "share under target"
         );
-        write_frame(sock, MSG_SHARE_ACK, &[ACK_UNDER_TARGET]).await?;
+        session
+            .write_frame(MSG_SHARE_ACK, &[ACK_UNDER_TARGET])
+            .await?;
     }
     Ok(())
 }
@@ -263,59 +306,74 @@ mod tests {
 
     #[tokio::test]
     async fn client_receives_template_and_share_is_acked() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
+        // Run the whole session over an in-memory duplex pipe so Noise
+        // can wrap both sides end-to-end without the TCP round-trip.
+        let (server_io, client_io) = tokio::io::duplex(16_384);
+        let keys = StaticKeys::generate().unwrap();
+        let server_pub = keys.public;
 
         let tmpl = build_fixture_template(1);
-        // Pre-seed the watch channel so the new subscriber sees it immediately.
         let (_tx, rx) = watch::channel::<Option<NewTemplateDinero>>(Some(tmpl.clone()));
         let rx_spawn = rx.clone();
+        let keys_spawn = keys.clone();
         tokio::spawn(async move {
-            let (sock, _) = listener.accept().await.unwrap();
-            serve_client(sock, rx_spawn, 0).await.unwrap();
+            let session = NoiseSession::accept_nx(server_io, &keys_spawn)
+                .await
+                .unwrap();
+            serve_client(session, rx_spawn, 0).await.unwrap();
         });
 
-        let mut client = TcpStream::connect(addr).await.unwrap();
+        let mut client = NoiseSession::initiate_nx(client_io, Some(&server_pub))
+            .await
+            .unwrap();
 
         // Receive a NewTemplate frame.
-        let (mtype, payload) = read_frame(&mut client).await.unwrap().unwrap();
+        let (mtype, payload) = client.read_frame().await.unwrap().unwrap();
         assert_eq!(mtype, MSG_NEW_TEMPLATE);
         assert_eq!(payload.len(), NEW_TEMPLATE_DINERO_SIZE);
 
         // Submit a share — with leading=0 the sim accepts everything.
         let share = fixture_share(0x1234_5678, tmpl.timestamp);
         let share_buf = encode_submit_shares(&share);
-        write_frame(&mut client, MSG_SUBMIT_SHARES, &share_buf)
+        client
+            .write_frame(MSG_SUBMIT_SHARES, &share_buf)
             .await
             .unwrap();
 
-        let (mtype, payload) = read_frame(&mut client).await.unwrap().unwrap();
+        let (mtype, payload) = client.read_frame().await.unwrap().unwrap();
         assert_eq!(mtype, MSG_SHARE_ACK);
         assert_eq!(payload, vec![ACK_OK]);
     }
 
     #[tokio::test]
     async fn malformed_share_gets_bad_shape_ack() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
+        let (server_io, client_io) = tokio::io::duplex(16_384);
+        let keys = StaticKeys::generate().unwrap();
+        let server_pub = keys.public;
 
         let tmpl = build_fixture_template(1);
         let (_tx, rx) = watch::channel::<Option<NewTemplateDinero>>(Some(tmpl));
         let rx_spawn = rx.clone();
+        let keys_spawn = keys.clone();
         tokio::spawn(async move {
-            let (sock, _) = listener.accept().await.unwrap();
-            serve_client(sock, rx_spawn, 0).await.unwrap();
+            let session = NoiseSession::accept_nx(server_io, &keys_spawn)
+                .await
+                .unwrap();
+            serve_client(session, rx_spawn, 0).await.unwrap();
         });
 
-        let mut client = TcpStream::connect(addr).await.unwrap();
-        // Drain the initial template frame.
-        let _ = read_frame(&mut client).await.unwrap().unwrap();
-
-        // Send short share payload.
-        write_frame(&mut client, MSG_SUBMIT_SHARES, &[0u8; 10])
+        let mut client = NoiseSession::initiate_nx(client_io, Some(&server_pub))
             .await
             .unwrap();
-        let (mtype, payload) = read_frame(&mut client).await.unwrap().unwrap();
+        // Drain the initial template frame.
+        let _ = client.read_frame().await.unwrap().unwrap();
+
+        // Send short share payload.
+        client
+            .write_frame(MSG_SUBMIT_SHARES, &[0u8; 10])
+            .await
+            .unwrap();
+        let (mtype, payload) = client.read_frame().await.unwrap().unwrap();
         assert_eq!(mtype, MSG_SHARE_ACK);
         assert_eq!(payload, vec![ACK_BAD_SHAPE]);
     }

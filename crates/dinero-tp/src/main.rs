@@ -21,9 +21,10 @@ use clap::Parser;
 use dinero_sv2_codec::{decode_submit_shares, encode_new_template};
 use dinero_sv2_common::{HeaderAssembly, NewTemplateDinero};
 use dinero_sv2_transport::{
-    read_frame, write_frame, ACK_BAD_SHAPE, ACK_OK, ACK_UNDER_TARGET, MSG_NEW_TEMPLATE,
+    NoiseSession, StaticKeys, ACK_BAD_SHAPE, ACK_OK, ACK_UNDER_TARGET, MSG_NEW_TEMPLATE,
     MSG_SHARE_ACK, MSG_SUBMIT_SHARES,
 };
+use std::path::PathBuf;
 use tokio::net::TcpStream;
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
@@ -67,18 +68,42 @@ struct Args {
     /// all structurally-valid shares (Phase 2.1 simulator default).
     #[arg(long, default_value_t = 0)]
     leading_zero_bits: u8,
+
+    /// Static Noise identity file. 64 bytes: `priv[0..32] || pub[32..64]`.
+    /// Auto-generated on first run with `0600` perms.
+    #[arg(long)]
+    tp_key: Option<PathBuf>,
+
+    /// Print the TP's static public key (hex) and exit.
+    #[arg(long)]
+    print_pubkey: bool,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let args = Args::parse();
+
+    let key_path = args.tp_key.clone().unwrap_or_else(default_tp_key_path);
+    let static_keys = StaticKeys::load_or_generate(&key_path)
+        .with_context(|| format!("loading TP key from {}", key_path.display()))?;
+
+    if args.print_pubkey {
+        println!("{}", static_keys.public_hex());
+        return Ok(());
+    }
+
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "dinero_tp=info".into()),
         )
         .init();
-
-    let args = Args::parse();
+    info!(
+        key = %key_path.display(),
+        pubkey = %static_keys.public_hex(),
+        "TP static identity"
+    );
 
     let auth = match (&args.rpc_user, &args.rpc_password, &args.cookie) {
         (Some(u), Some(p), _) => Auth::UserPass(u.clone(), p.clone()),
@@ -151,9 +176,18 @@ async fn main() -> Result<()> {
         let (sock, peer) = listener.accept().await?;
         let rx = rx.clone();
         let leading = args.leading_zero_bits;
+        let keys = static_keys.clone();
         tokio::spawn(async move {
-            info!(%peer, "miner connected");
-            if let Err(e) = serve_miner(sock, rx, leading).await {
+            info!(%peer, "miner connected — handshake starting");
+            let session = match NoiseSession::accept_nx(sock, &keys).await {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(%peer, error = %e, "noise handshake failed");
+                    return;
+                }
+            };
+            info!(%peer, "noise handshake complete");
+            if let Err(e) = serve_miner(session, rx, leading).await {
                 warn!(%peer, error = %e, "miner session ended with error");
             } else {
                 info!(%peer, "miner disconnected");
@@ -167,8 +201,13 @@ fn default_cookie_path() -> String {
     format!("{home}/.dinero/.cookie")
 }
 
+fn default_tp_key_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    PathBuf::from(format!("{home}/.dinero/dinero-tp.key"))
+}
+
 async fn serve_miner(
-    mut sock: TcpStream,
+    mut session: NoiseSession<TcpStream>,
     mut rx: watch::Receiver<Option<NewTemplateDinero>>,
     leading: u8,
 ) -> Result<()> {
@@ -179,7 +218,7 @@ async fn serve_miner(
     let initial = rx.borrow_and_update().clone();
     if let Some(t) = initial {
         let payload = encode_new_template(&t);
-        write_frame(&mut sock, MSG_NEW_TEMPLATE, &payload).await?;
+        session.write_frame(MSG_NEW_TEMPLATE, &payload).await?;
         debug!(template_id = t.template_id, "pushed initial template");
         current = Some(t);
     }
@@ -195,13 +234,13 @@ async fn serve_miner(
                 let maybe_t = rx.borrow_and_update().clone();
                 if let Some(t) = maybe_t {
                     let payload = encode_new_template(&t);
-                    write_frame(&mut sock, MSG_NEW_TEMPLATE, &payload).await?;
+                    session.write_frame(MSG_NEW_TEMPLATE, &payload).await?;
                     debug!(template_id = t.template_id, "pushed template");
                     current = Some(t);
                 }
             }
 
-            frame = read_frame(&mut sock) => {
+            frame = session.read_frame() => {
                 let (mtype, payload) = match frame? {
                     Some(f) => f,
                     None => return Ok(()),
@@ -212,13 +251,13 @@ async fn serve_miner(
                             Ok(s) => s,
                             Err(e) => {
                                 warn!(error = %e, "bad share shape");
-                                write_frame(&mut sock, MSG_SHARE_ACK, &[ACK_BAD_SHAPE]).await?;
+                                session.write_frame(MSG_SHARE_ACK, &[ACK_BAD_SHAPE]).await?;
                                 continue;
                             }
                         };
                         let Some(tmpl) = current.as_ref() else {
                             warn!("share before any template");
-                            write_frame(&mut sock, MSG_SHARE_ACK, &[ACK_BAD_SHAPE]).await?;
+                            session.write_frame(MSG_SHARE_ACK, &[ACK_BAD_SHAPE]).await?;
                             continue;
                         };
                         let hash = HeaderAssembly::hash(tmpl, &share);
@@ -230,10 +269,10 @@ async fn serve_miner(
                                 nonce = share.nonce,
                                 "accepted share"
                             );
-                            write_frame(&mut sock, MSG_SHARE_ACK, &[ACK_OK]).await?;
+                            session.write_frame(MSG_SHARE_ACK, &[ACK_OK]).await?;
                         } else {
                             debug!(hash = %hex::encode(hash), "share under target");
-                            write_frame(&mut sock, MSG_SHARE_ACK, &[ACK_UNDER_TARGET]).await?;
+                            session.write_frame(MSG_SHARE_ACK, &[ACK_UNDER_TARGET]).await?;
                         }
                     }
                     other => warn!(msg_type = other, "unexpected frame type from miner"),

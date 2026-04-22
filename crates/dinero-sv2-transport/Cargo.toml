@@ -12,6 +12,9 @@ description = "Dinero Stratum V2 transport — framing and (later) Noise NX wrap
 anyhow    = { workspace = true }
 thiserror = { workspace = true }
 tokio     = { workspace = true }
+snow      = { workspace = true }
+rand      = { workspace = true }
+hex       = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync"] }

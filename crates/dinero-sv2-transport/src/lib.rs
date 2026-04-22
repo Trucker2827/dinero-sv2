@@ -15,6 +15,12 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod keys;
+pub mod noise;
+
+pub use keys::StaticKeys;
+pub use noise::{NoiseSession, NOISE_MAX_PAYLOAD};
+
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Message type: server → client, a new [`NewTemplateDinero`] payload.
