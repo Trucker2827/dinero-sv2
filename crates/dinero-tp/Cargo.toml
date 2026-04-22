@@ -1,0 +1,32 @@
+[package]
+name        = "dinero-tp"
+version     = { workspace = true }
+edition     = { workspace = true }
+license     = { workspace = true }
+repository  = { workspace = true }
+authors     = { workspace = true }
+rust-version = { workspace = true }
+description = "Dinero Stratum V2 Template Provider — binds dinerod RPC, emits NewTemplateDinero frames"
+
+[[bin]]
+name = "dinero-tp"
+path = "src/main.rs"
+
+[dependencies]
+dinero-sv2-common    = { workspace = true }
+dinero-sv2-codec     = { workspace = true }
+dinero-sv2-transport = { workspace = true }
+anyhow     = { workspace = true }
+thiserror  = { workspace = true }
+hex        = { workspace = true }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+reqwest    = { workspace = true }
+base64     = { workspace = true }
+tokio      = { workspace = true }
+clap       = { workspace = true }
+tracing    = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync"] }

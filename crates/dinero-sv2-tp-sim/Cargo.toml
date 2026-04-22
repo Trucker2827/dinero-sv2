@@ -13,8 +13,9 @@ name = "dinero-sv2-tp-sim"
 path = "src/main.rs"
 
 [dependencies]
-dinero-sv2-common = { workspace = true }
-dinero-sv2-codec  = { workspace = true }
+dinero-sv2-common    = { workspace = true }
+dinero-sv2-codec     = { workspace = true }
+dinero-sv2-transport = { workspace = true }
 anyhow    = { workspace = true }
 hex       = { workspace = true }
 tokio     = { workspace = true }

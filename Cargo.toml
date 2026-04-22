@@ -3,7 +3,9 @@ resolver = "2"
 members = [
     "crates/dinero-sv2-common",
     "crates/dinero-sv2-codec",
+    "crates/dinero-sv2-transport",
     "crates/dinero-sv2-tp-sim",
+    "crates/dinero-tp",
 ]
 
 [workspace.package]
@@ -15,8 +17,9 @@ authors = ["Dinero Contributors"]
 rust-version = "1.75"
 
 [workspace.dependencies]
-dinero-sv2-common = { path = "crates/dinero-sv2-common" }
-dinero-sv2-codec  = { path = "crates/dinero-sv2-codec" }
+dinero-sv2-common    = { path = "crates/dinero-sv2-common" }
+dinero-sv2-codec     = { path = "crates/dinero-sv2-codec" }
+dinero-sv2-transport = { path = "crates/dinero-sv2-transport" }
 
 anyhow     = "1"
 thiserror  = "1"
@@ -29,6 +32,9 @@ tokio      = { version = "1", features = ["rt-multi-thread", "macros", "net", "i
 clap       = { version = "4", features = ["derive"] }
 tracing    = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+reqwest    = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+base64     = "0.22"
+async-trait = "0.1"
 
 [profile.release]
 lto = "thin"
