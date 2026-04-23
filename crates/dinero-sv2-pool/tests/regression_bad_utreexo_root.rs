@@ -8,37 +8,27 @@
 //! `coinbase-modified-after-template` guard (removed in Dinero
 //! `afbff521b`).
 //!
-//! ## Current status: KNOWN FAILING
+//! ## Background
 //!
-//! Running this test against Dinero at HEAD of `p2p-fix` shows the
-//! daemon silently accepts a block whose header carries a tampered
-//! `utreexo_root`. The block lands on the chain tip with the
-//! miner-submitted (wrong) root. Mechanism:
+//! When `afbff521b` removed the early template-root guard to let
+//! SV2-JD miners land blocks with self-chosen coinbases, an
+//! initial run of this test revealed the supposed canonical
+//! backstop wasn't active on the submitblock path:
+//! `BlockAcceptor::AcceptBlockFromRPC` called `ConnectBlock` with
+//! `updateTip=false` (`src/daemon/block_acceptor.cpp:192`), and
+//! the recompute-and-compare at `block_acceptor.cpp:1597-1636` was
+//! gated on `updateTip=true`.
 //!
-//! - `BlockAcceptor::AcceptBlockFromRPC` calls `ConnectBlock`
-//!   with `updateTip=false`
-//!   (`src/daemon/block_acceptor.cpp:192`) to defer canonical tip
-//!   writes to `ConnectTip`.
-//! - The utreexo-root recomputation at
-//!   `src/daemon/block_acceptor.cpp:1597-1636` is gated on
-//!   `updateTip=true`, so it never runs on this path.
-//! - `ConnectTip` in `chainstate_service.cpp` persists the block
-//!   and updates its own Utreexo forest but does NOT compare the
-//!   block header's `utreexo_root` against the recomputed value.
+//! Dinero's follow-up commit added an explicit
+//! `ComputeUtreexoRootPure` → header-comparison step inside
+//! `AcceptBlockFromRPC` before `ConnectBlock`, so the check now
+//! runs synchronously for every externally-submitted block and
+//! this test passes.
 //!
-//! The old `coinbase-modified-after-template` early guard in
-//! `rpc_submitblock_v14` used to catch this (as a
-//! side-effect of checking template-root membership). Removing it
-//! was correct for SV2-JD, but the canonical backstop the advice
-//! assumed was in place isn't actually active on this path.
+//! ## Running
 //!
-//! ## Keeping the test
-//!
-//! This test stays `#[ignore]`'d with a detailed explanation rather
-//! than being deleted or weakened. Once the utreexo check is wired
-//! into `ConnectTip` (or `AcceptBlockFromRPC` passes `updateTip=true`
-//! for the check), this test will flip from failing to passing, and
-//! that's the signal the fix is complete. Run explicitly with:
+//! `#[ignore]`'d so `cargo test` doesn't require dinerod on PATH.
+//! Run explicitly with:
 //!
 //! ```sh
 //! cargo test -p dinero-sv2-pool --test regression_bad_utreexo_root \
@@ -204,7 +194,7 @@ fn now_secs(floor: u64) -> u64 {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-#[ignore = "KNOWN FAILING: daemon's submitblock path does not validate header.utreexo_root against block contents — see module doc"]
+#[ignore = "spawns regtest dinerod; run with --ignored"]
 async fn submitblock_rejects_tampered_utreexo_root() -> Result<()> {
     let daemon = RegtestDaemon::spawn().context("spawn regtest dinerod")?;
     daemon.wait_for_cookie().context("wait for cookie")?;
