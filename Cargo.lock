@@ -363,6 +363,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "dinero-sv2-jd"
+version = "0.1.0"
+dependencies = [
+ "dinero-sv2-codec",
+ "dinero-sv2-common",
+ "hex",
+ "proptest",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "dinero-sv2-tp-sim"
 version = "0.1.0"
 dependencies = [

@@ -4,6 +4,7 @@ members = [
     "crates/dinero-sv2-common",
     "crates/dinero-sv2-codec",
     "crates/dinero-sv2-transport",
+    "crates/dinero-sv2-jd",
     "crates/dinero-sv2-tp-sim",
     "crates/dinero-tp",
 ]
@@ -20,6 +21,7 @@ rust-version = "1.75"
 dinero-sv2-common    = { path = "crates/dinero-sv2-common" }
 dinero-sv2-codec     = { path = "crates/dinero-sv2-codec" }
 dinero-sv2-transport = { path = "crates/dinero-sv2-transport" }
+dinero-sv2-jd        = { path = "crates/dinero-sv2-jd" }
 
 anyhow     = "1"
 thiserror  = "1"

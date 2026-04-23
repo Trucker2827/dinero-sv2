@@ -1,0 +1,20 @@
+[package]
+name        = "dinero-sv2-jd"
+version     = { workspace = true }
+edition     = { workspace = true }
+license     = { workspace = true }
+repository  = { workspace = true }
+authors     = { workspace = true }
+rust-version = { workspace = true }
+description = "Dinero Stratum V2 Job Declaration — miner-customizable templates + coinbase assembly"
+
+[dependencies]
+dinero-sv2-common = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+dinero-sv2-codec = { workspace = true }
+proptest   = { workspace = true }
+hex        = { workspace = true }
+serde      = { workspace = true }
+serde_json = { workspace = true }
