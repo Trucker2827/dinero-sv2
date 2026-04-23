@@ -319,3 +319,216 @@ async fn submitblock_rejects_tampered_utreexo_root() -> Result<()> {
 
     Ok(())
 }
+
+/// Companion test — tampered `utreexo_root` submitted as a
+/// **side-chain** block (parent != current tip).
+///
+/// The upstream `submitblock` fix in Dinero `a3c9fd839` gates the
+/// new utreexo check on `isMainChainExtension`. Side-chain blocks
+/// deliberately skip it, because their utreexo root is computed
+/// against a different fork's UTXO state and comparing it to the
+/// live main-chain forest produces false positives. A fork-aware
+/// check would need to walk back to the fork point and replay the
+/// alternate chain — substantial infrastructure not yet in place.
+///
+/// Empirically (2026-04-23) this means:
+///   - Accept-time: a tampered side-chain block is stored on disk.
+///     The acceptance-time utreexo check never fires.
+///   - Reorg-time: if a reorg tries to activate the tampered block,
+///     `ConnectTip → block_validator_->ConnectBlock →
+///     ValidateAndApplyBlock → ConnectBlockInternal(verify_root=true)`
+///     at `block_validation.cpp:1668-1705` catches the mismatch and
+///     refuses to activate it. The daemon falls back to an earlier
+///     ancestor rather than accepting a bad tip.
+///
+/// So chain integrity is preserved — no tampered block can become
+/// the main tip — but the accept-time gap means a malicious peer
+/// can fill side-chain storage with bad blocks. That's a
+/// disk/DoS concern, not a consensus escape.
+///
+/// This test is KNOWN FAILING to lock the gap in place: when a
+/// proper fork-aware accept-time check lands, the test flips green.
+///
+/// Flow:
+///   1. Before seeding, capture a template built on genesis.
+///   2. Seed one block so the captured template's parent becomes
+///      a non-tip ancestor (side-chain).
+///   3. Build the side-chain block from the captured template
+///      with a tampered `utreexo_root`.
+///   4. Submit. If accepted, invalidate the main tip to force a
+///      reorg attempt and confirm ConnectTip's backstop refuses
+///      to activate the tampered block.
+#[tokio::test]
+#[ignore = "KNOWN FAILING: side-chain accept-time utreexo check not implemented — see module doc"]
+async fn side_chain_tampered_utreexo_root() -> Result<()> {
+    let daemon = RegtestDaemon::spawn().context("spawn regtest dinerod")?;
+    daemon.wait_for_cookie().context("wait for cookie")?;
+
+    let rpc = RpcClient::new(
+        daemon.rpc_url.clone(),
+        Auth::Cookie(daemon.cookie_path.display().to_string()),
+    )?;
+
+    let create = rpc
+        .call_raw("wallet.createhd", serde_json::json!(["regtestw", "", false]))
+        .await
+        .context("createhd")?;
+    let address = create
+        .get("first_address")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("createhd did not return first_address: {create}"))?
+        .to_string();
+
+    // 1. Capture a pre-seed template. Its parent is genesis; its
+    //    height is 1. Using this template AFTER generatetoaddress
+    //    below yields a side-chain submission (same height as the
+    //    seed, different parent reference since the seed's prev IS
+    //    genesis too but different coinbase/hash — so B1 is a
+    //    competing height-1 block).
+    let gbt_side = rpc
+        .get_block_template(&address)
+        .await
+        .context("getblocktemplate (pre-seed)")?;
+    let mut pt_side = map_template(&gbt_side, 0).context("map_template side")?;
+
+    // 2. Seed one block so the chain advances past genesis and the
+    //    captured template's parent is no longer the main tip.
+    //    (Strictly speaking, after seeding the tip IS a height-1
+    //    block whose parent is genesis, same as our B1. The check
+    //    at block_acceptor.cpp:146 compares `block.prevBlockHash
+    //    == tip.hash`, which is false here because B1's prev is
+    //    genesis but the current tip is the seed block.)
+    let _ = rpc
+        .call_raw(
+            "generatetoaddress",
+            serde_json::json!([1u32, address.clone()]),
+        )
+        .await
+        .context("generatetoaddress 1")?;
+
+    // Refresh timestamp past current MTP.
+    let mintime = gbt_side
+        .get("mintime")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(pt_side.wire.timestamp);
+    pt_side.wire.timestamp = now_secs(mintime);
+
+    // 3. Tamper the utreexo_root.
+    let mut tampered = pt_side.wire.clone();
+    tampered.utreexo_root[0] ^= 0xFF;
+
+    let share_tmpl = make_share(&tampered);
+    let nonce = find_nonce(&tampered, &share_tmpl, &pt_side.block_target)
+        .ok_or_else(|| anyhow::anyhow!("no nonce found for tampered side-chain block"))?;
+    let mut share = share_tmpl.clone();
+    share.nonce = nonce;
+    let block_hex = assemble_block_hex(&tampered, &share, &pt_side.coinbase_full_hex)?;
+
+    // 4. Submit. Record outcome.
+    let outcome = rpc.submit_block(&block_hex).await?;
+
+    match outcome {
+        SubmitBlockResult::Rejected(reason) => {
+            let lower = reason.to_lowercase();
+            eprintln!("side-chain tampered block rejected at accept time: {reason}");
+            // Whatever the exact reason, this is safe: a block with
+            // a known-bad utreexo_root did not reach storage. The
+            // bad-utreexo-root string is ideal (proves the utreexo
+            // check actively fired) but any rejection is fine.
+            assert!(
+                !lower.contains("coinbase-modified-after-template"),
+                "rejection still cites the removed early guard: {reason}",
+            );
+            Ok(())
+        }
+        SubmitBlockResult::Accepted => {
+            eprintln!(
+                "side-chain tampered block was ACCEPTED at submit time — \
+                 daemon has stored a block with a known-bad utreexo_root"
+            );
+
+            // Compute our tampered block's hash so we can tell
+            // whether it became tip or is merely sitting in
+            // side-chain storage.
+            let tampered_hash = HeaderAssembly::hash(&tampered, &share);
+            let tampered_hash_display = {
+                let mut v = tampered_hash;
+                v.reverse();
+                hex::encode(v)
+            };
+            eprintln!("our tampered block hash = {tampered_hash_display}");
+
+            let tip_before = rpc
+                .call_raw("getbestblockhash", serde_json::json!([]))
+                .await
+                .context("getbestblockhash (pre-reorg)")?;
+            let tip_before_str = tip_before.as_str().unwrap_or("").to_string();
+            eprintln!("tip BEFORE reorg attempt: {tip_before_str}");
+
+            // Probe the reorg-time backstop. Invalidate the current
+            // tip so the daemon must choose another best chain; if
+            // our tampered block is the only other candidate at
+            // height 1, ConnectTip will try to activate it, hitting
+            // `block_validator_->ConnectBlock → ValidateAndApplyBlock`
+            // at chainstate_service.cpp:8290. That path is supposed
+            // to catch the root mismatch via
+            // ConnectBlockInternal(verify_root=true).
+            //
+            // After invalidate, one of:
+            //   a) tip = genesis   — reorg refused to activate the
+            //                        tampered block. Backstop works.
+            //                        Latent side-chain storage is
+            //                        harmless in practice.
+            //   b) tip = tampered  — daemon activated a block with
+            //                        a known-bad utreexo_root.
+            //                        Reorg-time backstop broken;
+            //                        mainnet safety gap.
+            let _ = rpc
+                .call_raw(
+                    "invalidateblock",
+                    serde_json::json!([tip_before_str]),
+                )
+                .await
+                .context("invalidateblock")?;
+
+            // ActivateBestChain runs synchronously inside the
+            // invalidateblock handler, but give it a moment to
+            // settle just in case.
+            tokio::time::sleep(Duration::from_millis(500)).await;
+
+            let tip_after = rpc
+                .call_raw("getbestblockhash", serde_json::json!([]))
+                .await
+                .context("getbestblockhash (post-reorg)")?;
+            let tip_after_str = tip_after.as_str().unwrap_or("").to_string();
+            eprintln!("tip AFTER invalidateblock:  {tip_after_str}");
+
+            if tip_after_str == tampered_hash_display {
+                bail!(
+                    "GAP CONFIRMED: tampered utreexo_root block activated \
+                     as chain tip via reorg. ConnectTip's verify_root=true \
+                     did not catch the mismatch. See \
+                     src/consensus/block_validation.cpp:1668-1705 and \
+                     src/daemon/services/chainstate_service.cpp:8290."
+                )
+            }
+
+            // Reorg refused to activate; tampered block is only
+            // in side-chain storage. Document and keep the test
+            // failing so the acceptance-time gap doesn't silently
+            // reopen — even though reorg-time is a functional
+            // backstop, defense-in-depth at accept time is the
+            // user's explicit preference.
+            bail!(
+                "side-chain tampered block accepted into storage \
+                 (not activated as tip — reorg backstop held). \
+                 Still a gap: a block with a known-bad utreexo_root \
+                 shouldn't reach on-disk storage in the first place. \
+                 Fix site: block_acceptor.cpp AcceptBlockFromRPC \
+                 step 5.6 — extend the check to cover side-chain \
+                 blocks (or add a step 5.7 using the fork-aware \
+                 forest walk)."
+            )
+        }
+    }
+}
