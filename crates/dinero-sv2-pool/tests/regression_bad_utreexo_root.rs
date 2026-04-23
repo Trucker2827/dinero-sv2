@@ -39,12 +39,12 @@
 //! `DINEROD_BIN` env var).
 
 use anyhow::{bail, Context, Result};
-use dinero_sv2_common::{HeaderAssembly, NewTemplateDinero, SubmitSharesDinero};
+use dinero_sv2_common::{sha256d, HeaderAssembly, NewTemplateDinero, SubmitSharesDinero};
 use dinero_sv2_pool::{
     block::assemble_block_hex,
     mapper::map_template,
     rpc::{Auth, RpcClient, SubmitBlockResult},
-    target::hash_meets_target,
+    target::{compact_to_target, hash_meets_target},
 };
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -187,6 +187,65 @@ fn now_secs(floor: u64) -> u64 {
         .map(|d| d.as_secs())
         .unwrap_or(floor);
     now.max(floor + 1)
+}
+
+/// Decode a 32-byte display-hex string (big-endian as users read it)
+/// into raw little-endian storage bytes — exactly the form that goes
+/// into header fields and the merkle tree.
+fn hex_reverse_32(display_hex: &str) -> Result<[u8; 32]> {
+    let mut bytes = hex::decode(display_hex).context("hex_reverse_32 decode")?;
+    if bytes.len() != 32 {
+        bail!("hex_reverse_32: expected 32 bytes, got {}", bytes.len());
+    }
+    bytes.reverse();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&bytes);
+    Ok(out)
+}
+
+/// Build a Bitcoin-style merkle root over raw txid bytes. Same shape
+/// Dinero uses internally: odd leaves at any level are duplicated,
+/// parent = `sha256d(left || right)`.
+fn build_merkle_root(leaves: &[[u8; 32]]) -> [u8; 32] {
+    if leaves.is_empty() {
+        return [0u8; 32];
+    }
+    if leaves.len() == 1 {
+        return leaves[0];
+    }
+    let mut level: Vec<[u8; 32]> = leaves.to_vec();
+    while level.len() > 1 {
+        let mut next: Vec<[u8; 32]> = Vec::with_capacity(level.len().div_ceil(2));
+        for chunk in level.chunks(2) {
+            let left = chunk[0];
+            let right = if chunk.len() == 2 { chunk[1] } else { chunk[0] };
+            let mut cat = [0u8; 64];
+            cat[..32].copy_from_slice(&left);
+            cat[32..].copy_from_slice(&right);
+            next.push(sha256d(&cat));
+        }
+        level = next;
+    }
+    level[0]
+}
+
+/// Bitcoin CompactSize varint encode.
+fn write_compact_size(n: u64) -> Vec<u8> {
+    if n < 0xFD {
+        vec![n as u8]
+    } else if n <= 0xFFFF {
+        let mut v = vec![0xFD];
+        v.extend_from_slice(&(n as u16).to_le_bytes());
+        v
+    } else if n <= 0xFFFF_FFFF {
+        let mut v = vec![0xFE];
+        v.extend_from_slice(&(n as u32).to_le_bytes());
+        v
+    } else {
+        let mut v = vec![0xFF];
+        v.extend_from_slice(&n.to_le_bytes());
+        v
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -531,5 +590,238 @@ async fn side_chain_tampered_utreexo_root() -> Result<()> {
                  forest walk)."
             )
         }
+    }
+}
+
+/// End-to-end multi-tx side-chain regression.
+///
+/// Exercises the fork-aware UTXO overlay path added in Dinero
+/// `f8b19ecf3`: `AcceptBlockFromRPC` walks main-chain undo records
+/// from current tip back to `parentHeight`, restoring spent UTXOs
+/// and removing created ones, then passes the overlay as a lookup
+/// to `ComputeUtreexoRootPureFromForest`. When that lookup
+/// correctly resolves non-coinbase inputs, the side-chain block's
+/// actual utreexo_root is computed and compared to the submitted
+/// header root — mismatch rejects before storage.
+///
+/// Scenario construction:
+///   1. Mine `COINBASE_MATURITY + 1` blocks so the first-mined
+///      coinbase is spendable (wallet enforces 100-confirmation
+///      maturity unconditionally in `wallet_manager.cpp`, so the
+///      test mines 101 blocks — ~3 seconds on regtest).
+///   2. `wallet.send` creates a tx that spends the mature coinbase,
+///      landing it in the mempool.
+///   3. Capture `getblocktemplate` — the template's `transactions`
+///      array now carries that tx.
+///   4. Mine one more block (absorbing the tx into main-chain);
+///      the captured template now describes a competing block at
+///      the same height as the new main tip. Parent of the
+///      captured template is still a main-chain block.
+///   5. Build the side-chain block body manually from the captured
+///      GBT, with `utreexo_root` tampered.
+///   6. Find a valid nonce against the tampered header.
+///   7. Submit. Expect `bad-utreexo-root`.
+///
+/// The point is verifying the overlay correctly reconstructs the
+/// forked UTXO view: the tx spends a UTXO that's spent on main
+/// but unspent on the fork, and the lookup has to return the
+/// restored entry — exactly the case the fix was designed for.
+#[tokio::test]
+#[ignore = "spawns regtest dinerod; mines past coinbase maturity (slower than the other cases)"]
+async fn side_chain_tampered_utreexo_root_multi_tx() -> Result<()> {
+    let daemon = RegtestDaemon::spawn().context("spawn regtest dinerod")?;
+    daemon.wait_for_cookie().context("wait for cookie")?;
+
+    let rpc = RpcClient::new(
+        daemon.rpc_url.clone(),
+        Auth::Cookie(daemon.cookie_path.display().to_string()),
+    )?;
+
+    let create = rpc
+        .call_raw("wallet.createhd", serde_json::json!(["regtestw", "", false]))
+        .await
+        .context("createhd")?;
+    let address = create
+        .get("first_address")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("createhd did not return first_address: {create}"))?
+        .to_string();
+
+    // 1. Mine past wallet-enforced coinbase maturity (100 confirmations)
+    //    so the first coinbase is spendable. Wallet's check is
+    //    unconditional in `wallet_manager.cpp` — doesn't look at
+    //    chain-params `coinbase_maturity`. Regtest's easy target
+    //    makes 101 blocks take ~3 seconds.
+    let _ = rpc
+        .call_raw(
+            "generatetoaddress",
+            serde_json::json!([101u32, address.clone()]),
+        )
+        .await
+        .context("generatetoaddress 101")?;
+
+    // 2. Create a transaction that spends the mature coinbase.
+    //    Any send to self at modest amount works.
+    let send_resp = rpc
+        .call_raw(
+            "sendtoaddress",
+            serde_json::json!([address.clone(), 1.0]),
+        )
+        .await
+        .context("sendtoaddress")?;
+    eprintln!("sendtoaddress -> {send_resp}");
+
+    // 3. Capture GBT with the tx in mempool.
+    let gbt_side = rpc
+        .get_block_template(&address)
+        .await
+        .context("getblocktemplate (multi-tx)")?;
+
+    let tx_array = gbt_side
+        .get("transactions")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if tx_array.is_empty() {
+        bail!(
+            "test precondition: sendtoaddress did not put a tx in mempool \
+             (or GBT isn't exposing it). wallet may have rejected the send."
+        );
+    }
+    eprintln!(
+        "captured GBT has {} mempool tx(s) + coinbase",
+        tx_array.len()
+    );
+
+    // Extract GBT fields manually — `map_template` refuses non-empty
+    // mempools on this pool build.
+    let prev_display = gbt_side
+        .get("previousblockhash")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("missing previousblockhash"))?;
+    let prev_block_hash = hex_reverse_32(prev_display)?;
+
+    let utreexo_display = gbt_side
+        .get("utreexocommitment")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("missing utreexocommitment"))?;
+    let utreexo_root_correct = hex_reverse_32(utreexo_display)?;
+
+    let bits_hex = gbt_side
+        .get("bits")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("missing bits"))?;
+    let difficulty = u32::from_str_radix(bits_hex, 16)?;
+    let block_target = compact_to_target(difficulty);
+
+    let version = gbt_side
+        .get("version")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(1) as u32;
+
+    let mintime = gbt_side
+        .get("mintime")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+
+    let coinbase_obj = gbt_side
+        .get("coinbasetxn")
+        .ok_or_else(|| anyhow::anyhow!("missing coinbasetxn"))?;
+    let coinbase_hex = coinbase_obj
+        .get("data")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("missing coinbasetxn.data"))?
+        .to_string();
+    let coinbase_txid_display = coinbase_obj
+        .get("txid")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("missing coinbasetxn.txid"))?;
+    let coinbase_txid_raw = hex_reverse_32(coinbase_txid_display)?;
+
+    // 4. Mine one more block so our captured template now describes
+    //    a competing side-chain block instead of a main-chain
+    //    extension.
+    let _ = rpc
+        .call_raw(
+            "generatetoaddress",
+            serde_json::json!([1u32, address.clone()]),
+        )
+        .await
+        .context("generatetoaddress 1 (to push captured template off the tip)")?;
+
+    // 5. Build the side-chain block body. Compute the merkle root
+    //    over [coinbase, tx1, ...]. Tamper utreexo_root by flipping
+    //    the first raw byte.
+    let mut leaves: Vec<[u8; 32]> = Vec::with_capacity(1 + tx_array.len());
+    leaves.push(coinbase_txid_raw);
+    for (i, t) in tx_array.iter().enumerate() {
+        let txid_display = t
+            .get("txid")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("missing txid on transaction #{i}"))?;
+        leaves.push(hex_reverse_32(txid_display)?);
+    }
+    let merkle_root_correct = build_merkle_root(&leaves);
+
+    let mut utreexo_root_tampered = utreexo_root_correct;
+    utreexo_root_tampered[0] ^= 0xFF;
+
+    let tampered_wire = NewTemplateDinero {
+        template_id: 1,
+        future_template: false,
+        version,
+        prev_block_hash,
+        merkle_root: merkle_root_correct,
+        utreexo_root: utreexo_root_tampered,
+        timestamp: now_secs(mintime),
+        difficulty,
+        coinbase_outputs_commitment: [0u8; 32],
+    };
+
+    // 6. Find a valid nonce for the tampered header.
+    let share_tmpl = make_share(&tampered_wire);
+    let nonce = find_nonce(&tampered_wire, &share_tmpl, &block_target)
+        .ok_or_else(|| anyhow::anyhow!("no nonce found for tampered multi-tx block"))?;
+    let mut share = share_tmpl.clone();
+    share.nonce = nonce;
+
+    // 7. Assemble block bytes: 128-byte header, varint tx count,
+    //    full coinbase hex (segwit-wrapped as the daemon supplied),
+    //    then each mempool tx's data.
+    let mut block_bytes: Vec<u8> = Vec::new();
+    let header = HeaderAssembly::bytes(&tampered_wire, &share);
+    block_bytes.extend_from_slice(&header);
+    block_bytes.extend_from_slice(&write_compact_size(leaves.len() as u64));
+    block_bytes.extend_from_slice(&hex::decode(&coinbase_hex).context("coinbase hex decode")?);
+    for (i, t) in tx_array.iter().enumerate() {
+        let data_hex = t
+            .get("data")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("missing data on transaction #{i}"))?;
+        block_bytes.extend_from_slice(&hex::decode(data_hex).context("tx data hex decode")?);
+    }
+    let block_hex = hex::encode(&block_bytes);
+
+    let outcome = rpc.submit_block(&block_hex).await?;
+    match outcome {
+        SubmitBlockResult::Rejected(reason) => {
+            eprintln!("multi-tx side-chain tampered block rejected: {reason}");
+            let lower = reason.to_lowercase();
+            assert!(
+                !lower.contains("coinbase-modified-after-template"),
+                "rejection still cites the removed early guard: {reason}",
+            );
+            assert!(
+                lower.contains("utreexo"),
+                "expected a utreexo-flavored rejection, got: {reason}",
+            );
+            Ok(())
+        }
+        SubmitBlockResult::Accepted => bail!(
+            "multi-tx side-chain tampered block was ACCEPTED — \
+             the fork-aware UTXO overlay didn't catch the mismatch. \
+             See block_acceptor.cpp AcceptBlockFromRPC step 5.6 and \
+             block_validation.cpp ComputeUtreexoRootPureFromForest."
+        ),
     }
 }
