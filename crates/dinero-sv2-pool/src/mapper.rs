@@ -6,6 +6,7 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use dinero_sv2_common::{sha256d, NewTemplateDinero};
+use dinero_sv2_jd::UtreexoAccumulatorState;
 use serde_json::Value;
 
 use crate::target::compact_to_target;
@@ -22,6 +23,11 @@ pub struct PoolTemplate {
     /// Block target (32-byte big-endian u256) derived from
     /// `getblocktemplate.bits`.
     pub block_target: [u8; 32],
+    /// Pre-coinbase Utreexo forest state (post-tip, pre-next-block).
+    /// JD-aware miners apply their own coinbase's leaves to this to
+    /// derive the header's final `utreexo_root`. Populated from
+    /// `getutreexoroots` at template-emission time.
+    pub utreexo_pre_block: Option<UtreexoAccumulatorState>,
 }
 
 /// Translate a `getblocktemplate` JSON object into a [`PoolTemplate`].
@@ -101,6 +107,39 @@ pub fn map_template(gbt: &Value, template_id: u64) -> Result<PoolTemplate> {
         wire,
         coinbase_full_hex,
         block_target: compact_to_target(difficulty),
+        utreexo_pre_block: None,
+    })
+}
+
+/// Parse `getutreexoroots` RPC response into a [`UtreexoAccumulatorState`].
+/// The RPC returns roots in display-order hex; since Dinero's Utreexo
+/// hashes are not byte-reversed for display (raw == display), we can
+/// take them as-is.
+pub fn map_utreexo_roots(json: &Value) -> Result<UtreexoAccumulatorState> {
+    let num_leaves = json
+        .get("num_leaves")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| anyhow!("missing num_leaves"))?;
+    let roots_arr = json
+        .get("roots")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("missing roots"))?;
+    let mut forest_roots = Vec::with_capacity(roots_arr.len());
+    for (i, v) in roots_arr.iter().enumerate() {
+        let s = v
+            .as_str()
+            .ok_or_else(|| anyhow!("roots[{i}] is not a string"))?;
+        let bytes = hex::decode(s).with_context(|| format!("roots[{i}] hex"))?;
+        if bytes.len() != 32 {
+            bail!("roots[{i}] is {} bytes, expected 32", bytes.len());
+        }
+        let mut a = [0u8; 32];
+        a.copy_from_slice(&bytes);
+        forest_roots.push(a);
+    }
+    Ok(UtreexoAccumulatorState {
+        forest_roots,
+        num_leaves,
     })
 }
 

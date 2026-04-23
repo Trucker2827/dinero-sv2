@@ -38,12 +38,13 @@ use dinero_sv2_common::{
     SetNewPrevHash, SetupConnectionError, SetupConnectionSuccess, SubmitSharesDinero,
     SubmitSharesError, SubmitSharesSuccess, PROTOCOL_MINING, PROTOCOL_VERSION,
 };
+use dinero_sv2_jd::encode_utreexo_accumulator_state;
 use dinero_sv2_transport::{
     Frame, NoiseSession, StaticKeys, MSG_NEW_MINING_JOB, MSG_OPEN_STANDARD_MINING_CHANNEL,
     MSG_OPEN_STANDARD_MINING_CHANNEL_ERROR, MSG_OPEN_STANDARD_MINING_CHANNEL_SUCCESS,
     MSG_SETUP_CONNECTION, MSG_SETUP_CONNECTION_ERROR, MSG_SETUP_CONNECTION_SUCCESS,
     MSG_SET_NEW_PREV_HASH, MSG_SUBMIT_SHARES_ERROR, MSG_SUBMIT_SHARES_STANDARD,
-    MSG_SUBMIT_SHARES_SUCCESS,
+    MSG_SUBMIT_SHARES_SUCCESS, MSG_UTREEXO_STATE,
 };
 use tokio::net::TcpStream;
 use tokio::sync::watch;
@@ -179,17 +180,34 @@ async fn main() -> Result<()> {
                     }
                 };
                 template_id = template_id.wrapping_add(1);
-                let pt = match mapper::map_template(&gbt, template_id) {
+                let mut pt = match mapper::map_template(&gbt, template_id) {
                     Ok(t) => t,
                     Err(e) => {
                         warn!(error = %e, "map_template failed");
                         continue;
                     }
                 };
+                match rpc.get_utreexo_roots().await {
+                    Ok(v) => match mapper::map_utreexo_roots(&v) {
+                        Ok(s) => {
+                            debug!(
+                                num_leaves = s.num_leaves,
+                                num_roots = s.forest_roots.len(),
+                                "utreexo pre-block state fetched"
+                            );
+                            pt.utreexo_pre_block = Some(s);
+                        }
+                        Err(e) => warn!(error = %e, "map_utreexo_roots failed"),
+                    },
+                    Err(e) => {
+                        warn!(error = %e, "getutreexoroots failed — JD miners won't be able to recompute utreexo_root");
+                    }
+                }
                 info!(
                     template_id = pt.wire.template_id,
                     tip = %tip,
                     block_target = %hex::encode(pt.block_target),
+                    utreexo_leaves = pt.utreexo_pre_block.as_ref().map(|s| s.num_leaves),
                     "new template"
                 );
                 let _ = tx.send(Some(pt));
@@ -429,12 +447,16 @@ async fn serve_miner(
     }
 }
 
-/// Emit `SetNewPrevHash` followed by `NewMiningJob` for this template.
+/// Emit `SetNewPrevHash`, optionally `UtreexoStateAnnouncement`, then
+/// `NewMiningJob` for this template.
 ///
-/// Every push is preceded by `SetNewPrevHash` so miners can explicitly
-/// invalidate any in-flight work on the old tip — required by SV2 for
-/// correct share/stale accounting on fast re-orgs and per-tick target
-/// updates.
+/// Every push starts with `SetNewPrevHash` so miners can explicitly
+/// invalidate any in-flight work on the old tip. Between that and the
+/// job, the pool sends the pre-coinbase Utreexo forest state (when
+/// available from dinerod) so JD-aware miners can apply their own
+/// coinbase leaves and recompute the header's `utreexo_root` —
+/// observable on the wire even before a miner actually diverges
+/// (useful Phase 4b verification).
 async fn push_job(
     session: &mut NoiseSession<TcpStream>,
     channel_id: u32,
@@ -449,9 +471,20 @@ async fn push_job(
     session
         .write_frame(MSG_SET_NEW_PREV_HASH, &encode_set_new_prev_hash(&snph))
         .await?;
+
+    if let Some(state) = &pt.utreexo_pre_block {
+        let payload = encode_utreexo_accumulator_state(state)
+            .map_err(|e| anyhow::anyhow!("utreexo state encode: {e}"))?;
+        session.write_frame(MSG_UTREEXO_STATE, &payload).await?;
+    }
+
     let payload = encode_new_template(&pt.wire);
     session.write_frame(MSG_NEW_MINING_JOB, &payload).await?;
-    debug!(template_id = pt.wire.template_id, "pushed SNPH + job");
+    debug!(
+        template_id = pt.wire.template_id,
+        utreexo_leaves = pt.utreexo_pre_block.as_ref().map(|s| s.num_leaves),
+        "pushed SNPH + (utreexo) + job"
+    );
     Ok(())
 }
 

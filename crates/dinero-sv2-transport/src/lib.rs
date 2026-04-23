@@ -55,6 +55,13 @@ pub const MSG_NEW_MINING_JOB: u8 = 0x15;
 /// [`MSG_NEW_MINING_JOB`] on that channel.
 pub const MSG_SET_NEW_PREV_HASH: u8 = 0x20;
 
+/// Mining (Dinero extension): `UtreexoStateAnnouncement` — pool
+/// ships the **pre-coinbase** Utreexo forest state that miners need
+/// to recompute the header's `utreexo_root` if they customize
+/// coinbase outputs. Sent between [`MSG_SET_NEW_PREV_HASH`] and
+/// [`MSG_NEW_MINING_JOB`].
+pub const MSG_UTREEXO_STATE: u8 = 0x21;
+
 /// Mining: `SubmitSharesStandard` (miner → pool). Payload is the
 /// fixed-size `SubmitSharesDinero`.
 pub const MSG_SUBMIT_SHARES_STANDARD: u8 = 0x1A;

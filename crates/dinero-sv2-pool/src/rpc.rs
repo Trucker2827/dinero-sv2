@@ -112,6 +112,14 @@ impl RpcClient {
         .await
     }
 
+    /// Fetch the post-tip Utreexo forest state (forest roots + leaf
+    /// count). This is the PRE-coinbase state for the next block —
+    /// what JD miners need to locally recompute `utreexo_root` after
+    /// they pick their own coinbase outputs.
+    pub async fn get_utreexo_roots(&self) -> Result<Value> {
+        self.call("getutreexoroots", serde_json::json!([])).await
+    }
+
     /// Submit a serialized block (hex). Accepted = result field is null.
     pub async fn submit_block(&self, block_hex: &str) -> Result<SubmitBlockResult> {
         let v = self

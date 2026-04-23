@@ -16,6 +16,7 @@ path = "src/main.rs"
 dinero-sv2-common    = { workspace = true }
 dinero-sv2-codec     = { workspace = true }
 dinero-sv2-transport = { workspace = true }
+dinero-sv2-jd        = { workspace = true }
 anyhow     = { workspace = true }
 thiserror  = { workspace = true }
 hex        = { workspace = true }

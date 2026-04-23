@@ -24,12 +24,13 @@ use dinero_sv2_common::{
     OpenStandardMiningChannel, SetupConnection, SubmitSharesDinero, PROTOCOL_MINING,
     PROTOCOL_VERSION,
 };
+use dinero_sv2_jd::{commitment as utreexo_commitment, decode_utreexo_accumulator_state};
 use dinero_sv2_transport::{
     Frame, NoiseSession, MSG_NEW_MINING_JOB, MSG_OPEN_STANDARD_MINING_CHANNEL,
     MSG_OPEN_STANDARD_MINING_CHANNEL_ERROR, MSG_OPEN_STANDARD_MINING_CHANNEL_SUCCESS,
     MSG_SETUP_CONNECTION, MSG_SETUP_CONNECTION_ERROR, MSG_SETUP_CONNECTION_SUCCESS,
     MSG_SET_NEW_PREV_HASH, MSG_SUBMIT_SHARES_ERROR, MSG_SUBMIT_SHARES_STANDARD,
-    MSG_SUBMIT_SHARES_SUCCESS,
+    MSG_SUBMIT_SHARES_SUCCESS, MSG_UTREEXO_STATE,
 };
 use std::net::SocketAddr;
 use tokio::net::TcpStream;
@@ -158,15 +159,38 @@ async fn main() -> Result<()> {
         snph.nbits,
     );
 
+    // ---- Optional UtreexoStateAnnouncement (Phase 4b) ----
+    // The frame between SetNewPrevHash and NewMiningJob is allowed to
+    // be either `UtreexoStateAnnouncement` (JD-aware pools) or the
+    // NewMiningJob directly (pools that don't publish pre-block state).
+    let f = session
+        .read_frame()
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("no frame after SetNewPrevHash"))?;
+    let nmj_frame = match f.msg_type {
+        MSG_UTREEXO_STATE => {
+            let state = decode_utreexo_accumulator_state(&f.payload)?;
+            let pre_block_commitment = utreexo_commitment(&state)?;
+            println!(
+                "UtreexoStateAnnouncement: num_leaves={} num_roots={} pre_block_commitment={}",
+                state.num_leaves,
+                state.forest_roots.len(),
+                hex::encode(pre_block_commitment),
+            );
+            session
+                .read_frame()
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("no mining job after utreexo state"))?
+        }
+        _ => f,
+    };
+
     // ---- NewMiningJob ----
     let Frame {
         msg_type: mtype,
         payload,
         ..
-    } = session
-        .read_frame()
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("no mining job"))?;
+    } = nmj_frame;
     if mtype != MSG_NEW_MINING_JOB {
         bail!(
             "expected MSG_NEW_MINING_JOB (0x{:02x}), got 0x{mtype:02x}",
