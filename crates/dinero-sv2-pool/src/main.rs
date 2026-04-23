@@ -28,23 +28,27 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use dinero_sv2_codec::{
     decode_open_standard_mining_channel, decode_setup_connection, decode_submit_shares,
-    encode_new_template, encode_open_standard_mining_channel_error,
-    encode_open_standard_mining_channel_success, encode_set_new_prev_hash,
-    encode_setup_connection_error, encode_setup_connection_success, encode_submit_shares_error,
-    encode_submit_shares_success,
+    decode_submit_shares_extended, encode_coinbase_context, encode_new_template,
+    encode_open_standard_mining_channel_error, encode_open_standard_mining_channel_success,
+    encode_set_new_prev_hash, encode_setup_connection_error, encode_setup_connection_success,
+    encode_submit_shares_error, encode_submit_shares_success,
 };
 use dinero_sv2_common::{
-    HeaderAssembly, OpenStandardMiningChannelError, OpenStandardMiningChannelSuccess,
-    SetNewPrevHash, SetupConnectionError, SetupConnectionSuccess, SubmitSharesDinero,
-    SubmitSharesError, SubmitSharesSuccess, PROTOCOL_MINING, PROTOCOL_VERSION,
+    CoinbaseContext, HeaderAssembly, NewTemplateDinero, OpenStandardMiningChannelError,
+    OpenStandardMiningChannelSuccess, SetNewPrevHash, SetupConnectionError, SetupConnectionSuccess,
+    SubmitSharesDinero, SubmitSharesError, SubmitSharesSuccess, PROTOCOL_MINING, PROTOCOL_VERSION,
 };
-use dinero_sv2_jd::encode_utreexo_accumulator_state;
+use dinero_sv2_jd::{
+    assemble_stripped_coinbase, commitment as utreexo_commitment, compute_root,
+    encode_utreexo_accumulator_state, leaf_hash, CoinbaseOutput,
+};
 use dinero_sv2_transport::{
-    Frame, NoiseSession, StaticKeys, MSG_NEW_MINING_JOB, MSG_OPEN_STANDARD_MINING_CHANNEL,
-    MSG_OPEN_STANDARD_MINING_CHANNEL_ERROR, MSG_OPEN_STANDARD_MINING_CHANNEL_SUCCESS,
-    MSG_SETUP_CONNECTION, MSG_SETUP_CONNECTION_ERROR, MSG_SETUP_CONNECTION_SUCCESS,
-    MSG_SET_NEW_PREV_HASH, MSG_SUBMIT_SHARES_ERROR, MSG_SUBMIT_SHARES_STANDARD,
-    MSG_SUBMIT_SHARES_SUCCESS, MSG_UTREEXO_STATE,
+    Frame, NoiseSession, StaticKeys, MSG_COINBASE_CONTEXT, MSG_NEW_MINING_JOB,
+    MSG_OPEN_STANDARD_MINING_CHANNEL, MSG_OPEN_STANDARD_MINING_CHANNEL_ERROR,
+    MSG_OPEN_STANDARD_MINING_CHANNEL_SUCCESS, MSG_SETUP_CONNECTION, MSG_SETUP_CONNECTION_ERROR,
+    MSG_SETUP_CONNECTION_SUCCESS, MSG_SET_NEW_PREV_HASH, MSG_SUBMIT_SHARES_ERROR,
+    MSG_SUBMIT_SHARES_EXTENDED, MSG_SUBMIT_SHARES_STANDARD, MSG_SUBMIT_SHARES_SUCCESS,
+    MSG_UTREEXO_STATE,
 };
 use tokio::net::TcpStream;
 use tokio::sync::watch;
@@ -440,6 +444,20 @@ async fn serve_miner(
                         )
                         .await?;
                     }
+                    MSG_SUBMIT_SHARES_EXTENDED => {
+                        handle_extended_share(
+                            &mut session,
+                            &payload,
+                            current.as_ref(),
+                            share_target,
+                            channel_id,
+                            &mut last_sequence_number,
+                            miner_key,
+                            rpc.as_ref(),
+                            ledger.as_ref(),
+                        )
+                        .await?;
+                    }
                     other => warn!(msg_type = other, "unexpected frame type from miner"),
                 }
             }
@@ -476,6 +494,22 @@ async fn push_job(
         let payload = encode_utreexo_accumulator_state(state)
             .map_err(|e| anyhow::anyhow!("utreexo state encode: {e}"))?;
         session.write_frame(MSG_UTREEXO_STATE, &payload).await?;
+
+        // When we have pre-block state, we also have the coinbase
+        // fragments + height + value the miner needs for JD. Emit
+        // `MSG_COINBASE_CONTEXT` so extended-share miners can assemble
+        // their own coinbase.
+        let ctx = CoinbaseContext {
+            channel_id,
+            coinbase_prefix: pt.coinbase_prefix.clone(),
+            coinbase_suffix: pt.coinbase_suffix.clone(),
+            merkle_path: pt.merkle_path.clone(),
+            height: pt.height,
+            coinbase_value_una: pt.coinbase_value_una,
+        };
+        let payload = encode_coinbase_context(&ctx)
+            .map_err(|e| anyhow::anyhow!("coinbase context encode: {e}"))?;
+        session.write_frame(MSG_COINBASE_CONTEXT, &payload).await?;
     }
 
     let payload = encode_new_template(&pt.wire);
@@ -483,7 +517,7 @@ async fn push_job(
     debug!(
         template_id = pt.wire.template_id,
         utreexo_leaves = pt.utreexo_pre_block.as_ref().map(|s| s.num_leaves),
-        "pushed SNPH + (utreexo) + job"
+        "pushed SNPH + (utreexo + ctx) + job"
     );
     Ok(())
 }
@@ -602,4 +636,226 @@ async fn try_submit_block(
 ) -> Result<SubmitBlockResult> {
     let block_hex = block::assemble_block_hex(template, share, coinbase_full_hex)?;
     rpc.submit_block(&block_hex).await
+}
+
+// =====================================================================
+// Phase 5: extended-share handling (miner supplies its own coinbase)
+// =====================================================================
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_extended_share(
+    session: &mut NoiseSession<TcpStream>,
+    payload: &[u8],
+    current: Option<&PoolTemplate>,
+    share_target: [u8; 32],
+    channel_id: u32,
+    last_sequence_number: &mut u32,
+    miner_key: MinerKey,
+    rpc: &RpcClient,
+    ledger: &Ledger,
+) -> Result<()> {
+    let ext = match decode_submit_shares_extended(payload) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(error = %e, "bad extended share shape");
+            ledger.reject(miner_key);
+            let err = SubmitSharesError {
+                channel_id,
+                sequence_number: *last_sequence_number,
+                error_code: b"invalid-payload".to_vec(),
+            };
+            session
+                .write_frame(MSG_SUBMIT_SHARES_ERROR, &encode_submit_shares_error(&err)?)
+                .await?;
+            return Ok(());
+        }
+    };
+    *last_sequence_number = ext.sequence_number;
+
+    let Some(pt) = current else {
+        warn!("extended share before any template");
+        ledger.reject(miner_key);
+        send_share_error(session, channel_id, ext.sequence_number, "no-template").await?;
+        return Ok(());
+    };
+    let Some(pre_block_state) = pt.utreexo_pre_block.as_ref() else {
+        warn!("extended share but no pre-block Utreexo state");
+        ledger.reject(miner_key);
+        send_share_error(session, channel_id, ext.sequence_number, "no-utreexo-state").await?;
+        return Ok(());
+    };
+
+    // 1. Validate the output value sum matches the block's coinbase value.
+    let miner_total: u64 = ext.coinbase_outputs.iter().map(|o| o.value_una).sum();
+    if miner_total != pt.coinbase_value_una {
+        warn!(
+            miner_total,
+            expected = pt.coinbase_value_una,
+            "extended share: coinbase output sum mismatch"
+        );
+        ledger.reject(miner_key);
+        send_share_error(session, channel_id, ext.sequence_number, "value-mismatch").await?;
+        return Ok(());
+    }
+
+    // 2. Reassemble the stripped coinbase using pool's prefix/suffix
+    //    and the miner's outputs.
+    let miner_outputs: Vec<CoinbaseOutput> = ext
+        .coinbase_outputs
+        .iter()
+        .map(|w| CoinbaseOutput {
+            value_una: w.value_una,
+            script_pubkey: w.script_pubkey.clone(),
+        })
+        .collect();
+    let (coinbase_stripped, coinbase_txid) =
+        assemble_stripped_coinbase(&pt.coinbase_prefix, &miner_outputs, &pt.coinbase_suffix);
+
+    // 3. Compute Utreexo leaf hashes for each output and apply.
+    let mut post_state = pre_block_state.clone();
+    for (i, out) in miner_outputs.iter().enumerate() {
+        let leaf = leaf_hash(&coinbase_txid, i as u32, out.value_una, &out.script_pubkey);
+        if let Err(e) = post_state.add_leaf(leaf) {
+            warn!(error = %e, "utreexo add_leaf failed");
+            ledger.reject(miner_key);
+            send_share_error(session, channel_id, ext.sequence_number, "utreexo-apply").await?;
+            return Ok(());
+        }
+    }
+    let utreexo_root = match utreexo_commitment(&post_state) {
+        Ok(h) => h,
+        Err(e) => {
+            warn!(error = %e, "utreexo commitment failed");
+            ledger.reject(miner_key);
+            send_share_error(session, channel_id, ext.sequence_number, "utreexo-commit").await?;
+            return Ok(());
+        }
+    };
+
+    // 4. Merkle root from coinbase txid + (possibly empty) merkle_path.
+    let merkle_root = compute_root(coinbase_txid, &pt.merkle_path);
+
+    // 5. Reconstruct the header via `HeaderAssembly` using our
+    //    computed (merkle_root, utreexo_root) and miner's (nonce,
+    //    ntime, version). Everything else inherits from the job.
+    let reconstructed = NewTemplateDinero {
+        template_id: pt.wire.template_id,
+        future_template: false,
+        version: ext.version,
+        prev_block_hash: pt.wire.prev_block_hash,
+        merkle_root,
+        utreexo_root,
+        timestamp: ext.timestamp,
+        difficulty: pt.wire.difficulty,
+        coinbase_outputs_commitment: [0u8; 32], // not header-relevant
+    };
+    let share = SubmitSharesDinero {
+        channel_id: ext.channel_id,
+        sequence_number: ext.sequence_number,
+        job_id: ext.job_id,
+        nonce: ext.nonce,
+        timestamp: ext.timestamp,
+        version: ext.version,
+    };
+    let hash = HeaderAssembly::hash(&reconstructed, &share);
+    let meets_share = hash_meets_target(&hash, &share_target);
+    let meets_block = hash_meets_target(&hash, &pt.block_target);
+
+    if !meets_share {
+        debug!(hash = %hex::encode(hash), "extended share below share-target");
+        send_share_error(session, channel_id, ext.sequence_number, "under-target").await?;
+        return Ok(());
+    }
+
+    ledger.credit_share(miner_key);
+    info!(
+        hash = %hex::encode(hash),
+        template_id = pt.wire.template_id,
+        nonce = ext.nonce,
+        utreexo_root = %hex::encode(utreexo_root),
+        "accepted extended share"
+    );
+    session
+        .write_frame(
+            MSG_SUBMIT_SHARES_SUCCESS,
+            &encode_submit_shares_success(&SubmitSharesSuccess {
+                channel_id,
+                last_sequence_number: ext.sequence_number,
+                new_submits_accepted_count: 1,
+                new_shares_sum: 1,
+            }),
+        )
+        .await?;
+
+    if meets_block {
+        // Reassemble the full block (segwit coinbase) for submitblock:
+        //   stripped-coinbase bytes with segwit marker+flag inserted
+        //   after version, and the pool-retained witness bytes inserted
+        //   before the locktime.
+        let full_coinbase = wrap_stripped_with_segwit_witness(
+            &coinbase_stripped,
+            &pt.coinbase_witness_bytes,
+            &pt.coinbase_suffix,
+        );
+        match block::assemble_block_hex_raw(&reconstructed, &share, &full_coinbase) {
+            Ok(block_hex) => match rpc.submit_block(&block_hex).await {
+                Ok(SubmitBlockResult::Accepted) => {
+                    info!("★ extended-share block ACCEPTED by dinerod");
+                    ledger.credit_block(miner_key);
+                }
+                Ok(SubmitBlockResult::Rejected(reason)) => {
+                    warn!(reason, "dinerod rejected our extended-share block");
+                }
+                Err(e) => warn!(error = %e, "submitblock RPC failed"),
+            },
+            Err(e) => warn!(error = %e, "assemble_block_hex_raw failed"),
+        }
+    }
+
+    Ok(())
+}
+
+async fn send_share_error(
+    session: &mut NoiseSession<TcpStream>,
+    channel_id: u32,
+    sequence_number: u32,
+    code: &str,
+) -> Result<()> {
+    let err = SubmitSharesError {
+        channel_id,
+        sequence_number,
+        error_code: code.as_bytes().to_vec(),
+    };
+    session
+        .write_frame(MSG_SUBMIT_SHARES_ERROR, &encode_submit_shares_error(&err)?)
+        .await?;
+    Ok(())
+}
+
+/// Wrap a stripped (non-segwit) coinbase with the retained segwit
+/// marker/flag + witness bytes so the result is the broadcast form
+/// dinerod expects in `submitblock`.
+///
+/// Inputs:
+/// - `stripped`: version || vin || vout || locktime
+/// - `witness_bytes`: the per-input witness stacks exactly as the
+///   daemon emitted them for the original template
+/// - `suffix`: just the 4-byte locktime (must match `stripped`'s tail)
+fn wrap_stripped_with_segwit_witness(
+    stripped: &[u8],
+    witness_bytes: &[u8],
+    suffix: &[u8],
+) -> Vec<u8> {
+    // stripped = version(4) || vin+vout || locktime(4)
+    // broadcast = version(4) || 00 01 || vin+vout || witness || locktime(4)
+    let locktime_len = suffix.len(); // typically 4
+    assert!(stripped.len() >= 4 + locktime_len);
+    let mid_end = stripped.len() - locktime_len;
+    let mut out = Vec::with_capacity(stripped.len() + 2 + witness_bytes.len());
+    out.extend_from_slice(&stripped[..4]); // version
+    out.extend_from_slice(&[0x00, 0x01]); // segwit marker + flag
+    out.extend_from_slice(&stripped[4..mid_end]); // vin + vout
+    out.extend_from_slice(witness_bytes); // witness stacks
+    out.extend_from_slice(&stripped[mid_end..]); // locktime
+    out
 }

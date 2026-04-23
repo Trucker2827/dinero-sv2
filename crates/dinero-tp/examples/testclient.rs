@@ -16,21 +16,26 @@
 use anyhow::{bail, Result};
 use clap::Parser;
 use dinero_sv2_codec::{
-    decode_new_template, decode_open_standard_mining_channel_success, decode_set_new_prev_hash,
-    decode_setup_connection_success, decode_submit_shares_error, decode_submit_shares_success,
-    encode_open_standard_mining_channel, encode_setup_connection, encode_submit_shares,
+    decode_coinbase_context, decode_new_template, decode_open_standard_mining_channel_success,
+    decode_set_new_prev_hash, decode_setup_connection_success, decode_submit_shares_error,
+    decode_submit_shares_success, encode_open_standard_mining_channel, encode_setup_connection,
+    encode_submit_shares, encode_submit_shares_extended,
 };
 use dinero_sv2_common::{
-    OpenStandardMiningChannel, SetupConnection, SubmitSharesDinero, PROTOCOL_MINING,
-    PROTOCOL_VERSION,
+    CoinbaseOutputWire, OpenStandardMiningChannel, SetupConnection, SubmitSharesDinero,
+    SubmitSharesExtendedDinero, PROTOCOL_MINING, PROTOCOL_VERSION,
 };
-use dinero_sv2_jd::{commitment as utreexo_commitment, decode_utreexo_accumulator_state};
+use dinero_sv2_jd::{
+    assemble_stripped_coinbase, commitment as utreexo_commitment, compute_root,
+    decode_utreexo_accumulator_state, leaf_hash, CoinbaseOutput, UtreexoAccumulatorState,
+};
 use dinero_sv2_transport::{
-    Frame, NoiseSession, MSG_NEW_MINING_JOB, MSG_OPEN_STANDARD_MINING_CHANNEL,
-    MSG_OPEN_STANDARD_MINING_CHANNEL_ERROR, MSG_OPEN_STANDARD_MINING_CHANNEL_SUCCESS,
-    MSG_SETUP_CONNECTION, MSG_SETUP_CONNECTION_ERROR, MSG_SETUP_CONNECTION_SUCCESS,
-    MSG_SET_NEW_PREV_HASH, MSG_SUBMIT_SHARES_ERROR, MSG_SUBMIT_SHARES_STANDARD,
-    MSG_SUBMIT_SHARES_SUCCESS, MSG_UTREEXO_STATE,
+    Frame, NoiseSession, MSG_COINBASE_CONTEXT, MSG_NEW_MINING_JOB,
+    MSG_OPEN_STANDARD_MINING_CHANNEL, MSG_OPEN_STANDARD_MINING_CHANNEL_ERROR,
+    MSG_OPEN_STANDARD_MINING_CHANNEL_SUCCESS, MSG_SETUP_CONNECTION, MSG_SETUP_CONNECTION_ERROR,
+    MSG_SETUP_CONNECTION_SUCCESS, MSG_SET_NEW_PREV_HASH, MSG_SUBMIT_SHARES_ERROR,
+    MSG_SUBMIT_SHARES_EXTENDED, MSG_SUBMIT_SHARES_STANDARD, MSG_SUBMIT_SHARES_SUCCESS,
+    MSG_UTREEXO_STATE,
 };
 use std::net::SocketAddr;
 use tokio::net::TcpStream;
@@ -44,6 +49,21 @@ struct Args {
     /// `dinero-sv2-pool --print-pubkey` to obtain it.
     #[arg(long)]
     server_pubkey: Option<String>,
+
+    /// Phase 5: Job Declaration mode. Instead of submitting a
+    /// standard share against the pool's coinbase, pick a local
+    /// payout script and submit a `SubmitSharesExtended` carrying
+    /// our own outputs. The pool will recompute the header's
+    /// `utreexo_root` from its pre-block state + our outputs.
+    #[arg(long)]
+    jd: bool,
+
+    /// JD mode: the payout scriptPubKey to use (hex). Defaults to a
+    /// 34-byte Taproot script with an all-`0xAB` key, so it's
+    /// structurally valid but unspendable — fine for wire-loop
+    /// verification.
+    #[arg(long)]
+    payout_script_hex: Option<String>,
 }
 
 #[tokio::main]
@@ -159,38 +179,56 @@ async fn main() -> Result<()> {
         snph.nbits,
     );
 
-    // ---- Optional UtreexoStateAnnouncement (Phase 4b) ----
-    // The frame between SetNewPrevHash and NewMiningJob is allowed to
-    // be either `UtreexoStateAnnouncement` (JD-aware pools) or the
-    // NewMiningJob directly (pools that don't publish pre-block state).
-    let f = session
+    // ---- Optional UtreexoStateAnnouncement + CoinbaseContext (Phase 4b/5) ----
+    // Between SetNewPrevHash and NewMiningJob we may get zero, one, or
+    // two extra frames depending on whether the pool is JD-capable.
+    let mut pre_block_state: Option<UtreexoAccumulatorState> = None;
+    let mut coinbase_ctx: Option<dinero_sv2_common::CoinbaseContext> = None;
+
+    let mut next = session
         .read_frame()
         .await?
         .ok_or_else(|| anyhow::anyhow!("no frame after SetNewPrevHash"))?;
-    let nmj_frame = match f.msg_type {
-        MSG_UTREEXO_STATE => {
-            let state = decode_utreexo_accumulator_state(&f.payload)?;
-            let pre_block_commitment = utreexo_commitment(&state)?;
-            println!(
-                "UtreexoStateAnnouncement: num_leaves={} num_roots={} pre_block_commitment={}",
-                state.num_leaves,
-                state.forest_roots.len(),
-                hex::encode(pre_block_commitment),
-            );
-            session
-                .read_frame()
-                .await?
-                .ok_or_else(|| anyhow::anyhow!("no mining job after utreexo state"))?
-        }
-        _ => f,
-    };
+
+    if next.msg_type == MSG_UTREEXO_STATE {
+        let state = decode_utreexo_accumulator_state(&next.payload)?;
+        let pre_block_commitment = utreexo_commitment(&state)?;
+        println!(
+            "UtreexoStateAnnouncement: num_leaves={} num_roots={} pre_block_commitment={}",
+            state.num_leaves,
+            state.forest_roots.len(),
+            hex::encode(pre_block_commitment),
+        );
+        pre_block_state = Some(state);
+        next = session
+            .read_frame()
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("no frame after UtreexoState"))?;
+    }
+
+    if next.msg_type == MSG_COINBASE_CONTEXT {
+        let ctx = decode_coinbase_context(&next.payload)?;
+        println!(
+            "CoinbaseContext: height={} value_una={} merkle_path_len={} prefix={}B suffix={}B",
+            ctx.height,
+            ctx.coinbase_value_una,
+            ctx.merkle_path.len(),
+            ctx.coinbase_prefix.len(),
+            ctx.coinbase_suffix.len(),
+        );
+        coinbase_ctx = Some(ctx);
+        next = session
+            .read_frame()
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("no frame after CoinbaseContext"))?;
+    }
 
     // ---- NewMiningJob ----
     let Frame {
         msg_type: mtype,
         payload,
         ..
-    } = nmj_frame;
+    } = next;
     if mtype != MSG_NEW_MINING_JOB {
         bail!(
             "expected MSG_NEW_MINING_JOB (0x{:02x}), got 0x{mtype:02x}",
@@ -206,19 +244,35 @@ async fn main() -> Result<()> {
         tmpl.difficulty
     );
 
-    // ---- Submit one synthetic share ----
-    let share = SubmitSharesDinero {
-        channel_id,
-        sequence_number: 1,
-        job_id: u32::try_from(tmpl.template_id).unwrap_or(0),
-        nonce: 0xDEAD_BEEF,
-        timestamp: tmpl.timestamp,
-        version: tmpl.version,
-    };
-    let buf = encode_submit_shares(&share);
-    session
-        .write_frame(MSG_SUBMIT_SHARES_STANDARD, &buf)
+    // ---- Submit a share ----
+    if args.jd {
+        submit_extended_share(
+            &mut session,
+            &tmpl,
+            channel_id,
+            pre_block_state
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("JD mode requires UtreexoStateAnnouncement"))?,
+            coinbase_ctx
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("JD mode requires CoinbaseContext"))?,
+            args.payout_script_hex.as_deref(),
+        )
         .await?;
+    } else {
+        let share = SubmitSharesDinero {
+            channel_id,
+            sequence_number: 1,
+            job_id: u32::try_from(tmpl.template_id).unwrap_or(0),
+            nonce: 0xDEAD_BEEF,
+            timestamp: tmpl.timestamp,
+            version: tmpl.version,
+        };
+        let buf = encode_submit_shares(&share);
+        session
+            .write_frame(MSG_SUBMIT_SHARES_STANDARD, &buf)
+            .await?;
+    }
     let f = session
         .read_frame()
         .await?
@@ -246,5 +300,75 @@ async fn main() -> Result<()> {
         other => bail!("unexpected response to share submit: 0x{other:02x}"),
     }
 
+    Ok(())
+}
+
+/// JD mode: the miner owns its coinbase outputs end to end. Picks a
+/// local payout script, assembles the coinbase locally, computes the
+/// post-coinbase Utreexo state + header `utreexo_root`, and submits
+/// an extended share carrying those outputs.
+async fn submit_extended_share(
+    session: &mut NoiseSession<tokio::net::TcpStream>,
+    tmpl: &dinero_sv2_common::NewTemplateDinero,
+    channel_id: u32,
+    pre_block_state: &UtreexoAccumulatorState,
+    ctx: &dinero_sv2_common::CoinbaseContext,
+    payout_script_hex: Option<&str>,
+) -> Result<()> {
+    let payout_script = match payout_script_hex {
+        Some(h) => hex::decode(h)?,
+        None => {
+            // Default: 34-byte Taproot-shaped script `OP_1 0x20 <32 bytes of 0xAB>`.
+            // Structurally valid, unspendable — perfect for wire
+            // demonstration.
+            let mut s = vec![0x51, 0x20];
+            s.extend_from_slice(&[0xAB; 32]);
+            s
+        }
+    };
+
+    // Single output paying the entire coinbase value to our chosen
+    // payout script.
+    let miner_outputs = vec![CoinbaseOutput {
+        value_una: ctx.coinbase_value_una,
+        script_pubkey: payout_script.clone(),
+    }];
+
+    let (_coinbase_bytes, coinbase_txid) =
+        assemble_stripped_coinbase(&ctx.coinbase_prefix, &miner_outputs, &ctx.coinbase_suffix);
+
+    // Apply our one coinbase output's leaf to the pre-block state.
+    let mut post_state = pre_block_state.clone();
+    for (i, out) in miner_outputs.iter().enumerate() {
+        let leaf = leaf_hash(&coinbase_txid, i as u32, out.value_una, &out.script_pubkey);
+        post_state.add_leaf(leaf)?;
+    }
+    let our_utreexo_root = utreexo_commitment(&post_state)?;
+    let merkle_root = compute_root(coinbase_txid, &ctx.merkle_path);
+
+    println!(
+        "JD locally computed: coinbase_txid={} merkle_root={} utreexo_root={} (pool said {})",
+        hex::encode(coinbase_txid),
+        hex::encode(merkle_root),
+        hex::encode(our_utreexo_root),
+        hex::encode(tmpl.utreexo_root),
+    );
+
+    let ext = SubmitSharesExtendedDinero {
+        channel_id,
+        sequence_number: 1,
+        job_id: u32::try_from(tmpl.template_id).unwrap_or(0),
+        nonce: 0xDEAD_BEEF,
+        timestamp: tmpl.timestamp,
+        version: tmpl.version,
+        coinbase_outputs: vec![CoinbaseOutputWire {
+            value_una: miner_outputs[0].value_una,
+            script_pubkey: miner_outputs[0].script_pubkey.clone(),
+        }],
+    };
+    let buf = encode_submit_shares_extended(&ext)?;
+    session
+        .write_frame(MSG_SUBMIT_SHARES_EXTENDED, &buf)
+        .await?;
     Ok(())
 }

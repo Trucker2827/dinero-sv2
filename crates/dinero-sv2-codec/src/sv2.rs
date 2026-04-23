@@ -8,15 +8,21 @@
 //! followed by `len` raw bytes (so the max string length is 255).
 
 use dinero_sv2_common::{
-    OpenStandardMiningChannel, OpenStandardMiningChannelError, OpenStandardMiningChannelSuccess,
-    SetNewPrevHash, SetupConnection, SetupConnectionError, SetupConnectionSuccess,
-    SubmitSharesError, SubmitSharesSuccess,
+    CoinbaseContext, CoinbaseOutputWire, OpenStandardMiningChannel, OpenStandardMiningChannelError,
+    OpenStandardMiningChannelSuccess, SetNewPrevHash, SetupConnection, SetupConnectionError,
+    SetupConnectionSuccess, SubmitSharesError, SubmitSharesExtendedDinero, SubmitSharesSuccess,
 };
+
+/// Variable-field caps (Phase 5).
+const MAX_COINBASE_BLOB: usize = 1_048_576;
+const MAX_MERKLE_ENTRIES: usize = 64;
+const MAX_EXTENDED_OUTPUTS: usize = 64;
+const MAX_SCRIPTPUBKEY_BYTES: usize = 10_000;
 
 /// Hard cap on a STR0_255 length byte.
 const STR0_255_MAX: usize = 255;
 
-/// Pass-B codec errors.
+/// Pass-B/5 codec errors.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum Sv2CodecError {
     /// Not enough input bytes to finish decoding.
@@ -37,6 +43,16 @@ pub enum Sv2CodecError {
     /// since the length is a `u8`, but useful if we ever widen).
     #[error("string too long: {0} > {STR0_255_MAX}")]
     StringTooLong(usize),
+    /// A length prefix exceeded the per-field cap.
+    #[error("length {got} exceeds cap {cap} for {field}")]
+    TooLarge {
+        /// Field name.
+        field: &'static str,
+        /// Got.
+        got: usize,
+        /// Cap.
+        cap: usize,
+    },
 }
 
 // ----------------------------- SetupConnection -----------------------------
@@ -217,6 +233,216 @@ pub fn decode_set_new_prev_hash(buf: &[u8]) -> Result<SetNewPrevHash, Sv2CodecEr
         prev_hash,
         min_ntime,
         nbits,
+    })
+}
+
+// ------------------------- CoinbaseContext (Phase 5) -------------------------
+
+/// Encode a [`CoinbaseContext`]. Wire:
+/// ```text
+/// channel_id       u32 LE
+/// coinbase_prefix  u32 LE len || bytes (≤ 1 MiB)
+/// coinbase_suffix  u32 LE len || bytes (≤ 1 MiB)
+/// merkle_path      u16 LE count || count * 32 bytes (≤ 64)
+/// height           u32 LE
+/// coinbase_value   u64 LE
+/// ```
+pub fn encode_coinbase_context(msg: &CoinbaseContext) -> Result<Vec<u8>, Sv2CodecError> {
+    if msg.coinbase_prefix.len() > MAX_COINBASE_BLOB {
+        return Err(Sv2CodecError::TooLarge {
+            field: "coinbase_prefix",
+            got: msg.coinbase_prefix.len(),
+            cap: MAX_COINBASE_BLOB,
+        });
+    }
+    if msg.coinbase_suffix.len() > MAX_COINBASE_BLOB {
+        return Err(Sv2CodecError::TooLarge {
+            field: "coinbase_suffix",
+            got: msg.coinbase_suffix.len(),
+            cap: MAX_COINBASE_BLOB,
+        });
+    }
+    if msg.merkle_path.len() > MAX_MERKLE_ENTRIES {
+        return Err(Sv2CodecError::TooLarge {
+            field: "merkle_path",
+            got: msg.merkle_path.len(),
+            cap: MAX_MERKLE_ENTRIES,
+        });
+    }
+
+    let mut out = Vec::with_capacity(
+        4 + 4
+            + msg.coinbase_prefix.len()
+            + 4
+            + msg.coinbase_suffix.len()
+            + 2
+            + msg.merkle_path.len() * 32
+            + 4
+            + 8,
+    );
+    out.extend_from_slice(&msg.channel_id.to_le_bytes());
+    out.extend_from_slice(&(msg.coinbase_prefix.len() as u32).to_le_bytes());
+    out.extend_from_slice(&msg.coinbase_prefix);
+    out.extend_from_slice(&(msg.coinbase_suffix.len() as u32).to_le_bytes());
+    out.extend_from_slice(&msg.coinbase_suffix);
+    out.extend_from_slice(&(msg.merkle_path.len() as u16).to_le_bytes());
+    for h in &msg.merkle_path {
+        out.extend_from_slice(h);
+    }
+    out.extend_from_slice(&msg.height.to_le_bytes());
+    out.extend_from_slice(&msg.coinbase_value_una.to_le_bytes());
+    Ok(out)
+}
+
+/// Decode a [`CoinbaseContext`].
+pub fn decode_coinbase_context(buf: &[u8]) -> Result<CoinbaseContext, Sv2CodecError> {
+    let mut cur = Cursor::new(buf);
+    let channel_id = cur.read_u32()?;
+
+    let prefix_len = cur.read_u32()? as usize;
+    if prefix_len > MAX_COINBASE_BLOB {
+        return Err(Sv2CodecError::TooLarge {
+            field: "coinbase_prefix",
+            got: prefix_len,
+            cap: MAX_COINBASE_BLOB,
+        });
+    }
+    let coinbase_prefix = cur.take(prefix_len)?.to_vec();
+
+    let suffix_len = cur.read_u32()? as usize;
+    if suffix_len > MAX_COINBASE_BLOB {
+        return Err(Sv2CodecError::TooLarge {
+            field: "coinbase_suffix",
+            got: suffix_len,
+            cap: MAX_COINBASE_BLOB,
+        });
+    }
+    let coinbase_suffix = cur.take(suffix_len)?.to_vec();
+
+    let path_len = cur.read_u16()? as usize;
+    if path_len > MAX_MERKLE_ENTRIES {
+        return Err(Sv2CodecError::TooLarge {
+            field: "merkle_path",
+            got: path_len,
+            cap: MAX_MERKLE_ENTRIES,
+        });
+    }
+    let mut merkle_path = Vec::with_capacity(path_len);
+    for _ in 0..path_len {
+        merkle_path.push(cur.read_array32()?);
+    }
+
+    let height = cur.read_u32()?;
+    let coinbase_value_una = cur.read_u64()?;
+    cur.finish()?;
+    Ok(CoinbaseContext {
+        channel_id,
+        coinbase_prefix,
+        coinbase_suffix,
+        merkle_path,
+        height,
+        coinbase_value_una,
+    })
+}
+
+// ------------------------- SubmitSharesExtended (Phase 5) -------------------------
+
+/// Encode a [`SubmitSharesExtendedDinero`]. Wire:
+/// ```text
+/// channel_id            u32 LE
+/// sequence_number       u32 LE
+/// job_id                u32 LE
+/// nonce                 u32 LE
+/// timestamp             u64 LE
+/// version               u32 LE
+/// output_count          u16 LE  (≤ 64)
+/// output_i:
+///   value               u64 LE
+///   script_pubkey_len   u32 LE  (≤ 10_000)
+///   script_pubkey       bytes
+/// ```
+pub fn encode_submit_shares_extended(
+    msg: &SubmitSharesExtendedDinero,
+) -> Result<Vec<u8>, Sv2CodecError> {
+    if msg.coinbase_outputs.len() > MAX_EXTENDED_OUTPUTS {
+        return Err(Sv2CodecError::TooLarge {
+            field: "coinbase_outputs",
+            got: msg.coinbase_outputs.len(),
+            cap: MAX_EXTENDED_OUTPUTS,
+        });
+    }
+    let mut total_script = 0usize;
+    for o in &msg.coinbase_outputs {
+        if o.script_pubkey.len() > MAX_SCRIPTPUBKEY_BYTES {
+            return Err(Sv2CodecError::TooLarge {
+                field: "script_pubkey",
+                got: o.script_pubkey.len(),
+                cap: MAX_SCRIPTPUBKEY_BYTES,
+            });
+        }
+        total_script += 8 + 4 + o.script_pubkey.len();
+    }
+    let mut out = Vec::with_capacity(4 * 4 + 8 + 4 + 2 + total_script);
+    out.extend_from_slice(&msg.channel_id.to_le_bytes());
+    out.extend_from_slice(&msg.sequence_number.to_le_bytes());
+    out.extend_from_slice(&msg.job_id.to_le_bytes());
+    out.extend_from_slice(&msg.nonce.to_le_bytes());
+    out.extend_from_slice(&msg.timestamp.to_le_bytes());
+    out.extend_from_slice(&msg.version.to_le_bytes());
+    out.extend_from_slice(&(msg.coinbase_outputs.len() as u16).to_le_bytes());
+    for o in &msg.coinbase_outputs {
+        out.extend_from_slice(&o.value_una.to_le_bytes());
+        out.extend_from_slice(&(o.script_pubkey.len() as u32).to_le_bytes());
+        out.extend_from_slice(&o.script_pubkey);
+    }
+    Ok(out)
+}
+
+/// Decode a [`SubmitSharesExtendedDinero`].
+pub fn decode_submit_shares_extended(
+    buf: &[u8],
+) -> Result<SubmitSharesExtendedDinero, Sv2CodecError> {
+    let mut cur = Cursor::new(buf);
+    let channel_id = cur.read_u32()?;
+    let sequence_number = cur.read_u32()?;
+    let job_id = cur.read_u32()?;
+    let nonce = cur.read_u32()?;
+    let timestamp = cur.read_u64()?;
+    let version = cur.read_u32()?;
+    let n = cur.read_u16()? as usize;
+    if n > MAX_EXTENDED_OUTPUTS {
+        return Err(Sv2CodecError::TooLarge {
+            field: "coinbase_outputs",
+            got: n,
+            cap: MAX_EXTENDED_OUTPUTS,
+        });
+    }
+    let mut coinbase_outputs = Vec::with_capacity(n);
+    for _ in 0..n {
+        let value_una = cur.read_u64()?;
+        let script_len = cur.read_u32()? as usize;
+        if script_len > MAX_SCRIPTPUBKEY_BYTES {
+            return Err(Sv2CodecError::TooLarge {
+                field: "script_pubkey",
+                got: script_len,
+                cap: MAX_SCRIPTPUBKEY_BYTES,
+            });
+        }
+        let script_pubkey = cur.take(script_len)?.to_vec();
+        coinbase_outputs.push(CoinbaseOutputWire {
+            value_una,
+            script_pubkey,
+        });
+    }
+    cur.finish()?;
+    Ok(SubmitSharesExtendedDinero {
+        channel_id,
+        sequence_number,
+        job_id,
+        nonce,
+        timestamp,
+        version,
+        coinbase_outputs,
     })
 }
 
@@ -491,6 +717,77 @@ mod tests {
         };
         let bytes = encode_submit_shares_success(&m);
         assert_eq!(m, decode_submit_shares_success(&bytes).unwrap());
+    }
+
+    #[test]
+    fn coinbase_context_roundtrip() {
+        let m = CoinbaseContext {
+            channel_id: 1,
+            coinbase_prefix: vec![1, 2, 3, 4, 5],
+            coinbase_suffix: vec![0, 0, 0, 0],
+            merkle_path: vec![[0x11; 32], [0x22; 32]],
+            height: 5180,
+            coinbase_value_una: 10_000_000_000,
+        };
+        let bytes = encode_coinbase_context(&m).unwrap();
+        assert_eq!(m, decode_coinbase_context(&bytes).unwrap());
+    }
+
+    #[test]
+    fn coinbase_context_empty_merkle_path_roundtrip() {
+        let m = CoinbaseContext {
+            channel_id: 7,
+            coinbase_prefix: b"prefix".to_vec(),
+            coinbase_suffix: b"sfx".to_vec(),
+            merkle_path: vec![],
+            height: 1,
+            coinbase_value_una: 0,
+        };
+        let bytes = encode_coinbase_context(&m).unwrap();
+        assert_eq!(m, decode_coinbase_context(&bytes).unwrap());
+    }
+
+    #[test]
+    fn submit_shares_extended_roundtrip() {
+        let m = SubmitSharesExtendedDinero {
+            channel_id: 1,
+            sequence_number: 42,
+            job_id: 7,
+            nonce: 0xDEAD_BEEF,
+            timestamp: 1_776_384_000,
+            version: 1,
+            coinbase_outputs: vec![
+                CoinbaseOutputWire {
+                    value_una: 9_999_999_000,
+                    script_pubkey: {
+                        let mut s = vec![0x51, 0x20];
+                        s.extend_from_slice(&[0xAB; 32]);
+                        s
+                    },
+                },
+                CoinbaseOutputWire {
+                    value_una: 1_000,
+                    script_pubkey: vec![0x6a, 0x03, 0x44, 0x49, 0x4e], // OP_RETURN DIN
+                },
+            ],
+        };
+        let bytes = encode_submit_shares_extended(&m).unwrap();
+        assert_eq!(m, decode_submit_shares_extended(&bytes).unwrap());
+    }
+
+    #[test]
+    fn submit_shares_extended_no_outputs_is_legal() {
+        let m = SubmitSharesExtendedDinero {
+            channel_id: 1,
+            sequence_number: 1,
+            job_id: 1,
+            nonce: 0,
+            timestamp: 0,
+            version: 0,
+            coinbase_outputs: vec![],
+        };
+        let bytes = encode_submit_shares_extended(&m).unwrap();
+        assert_eq!(m, decode_submit_shares_extended(&bytes).unwrap());
     }
 
     #[test]

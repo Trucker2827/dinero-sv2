@@ -136,6 +136,88 @@ pub struct SubmitSharesError {
     pub error_code: Vec<u8>,
 }
 
+/// Pool → miner: coinbase-construction context (Phase 5, Dinero
+/// extension).
+///
+/// Carries the bytes and merkle position the miner needs to assemble
+/// its own coinbase with its own payout outputs — then apply the
+/// resulting UTXO leaves to the pre-block Utreexo state received
+/// earlier. `coinbase_prefix` is everything up to (but not including)
+/// the output_count varint; `coinbase_suffix` is everything after the
+/// outputs (locktime, typically 4 zero bytes). `merkle_path` is the
+/// sequence of right-sibling hashes from the coinbase leaf up to the
+/// block's merkle root — empty when the block is coinbase-only.
+///
+/// Height and value are sent so the miner can cross-check the prefix
+/// (BIP34 height encoding in scriptSig) and total-value allocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoinbaseContext {
+    /// Channel this applies to.
+    pub channel_id: u32,
+    /// Raw bytes from the start of the stripped coinbase serialization
+    /// up to the output_count varint (not inclusive).
+    pub coinbase_prefix: Vec<u8>,
+    /// Raw bytes from after the outputs section to the end of the
+    /// stripped coinbase (typically just the 4-byte locktime).
+    pub coinbase_suffix: Vec<u8>,
+    /// Right-sibling hashes from the coinbase leaf up to the root.
+    /// Empty for a single-tx (coinbase-only) block.
+    pub merkle_path: Vec<[u8; 32]>,
+    /// Block height of the job (matches BIP34 height in scriptSig).
+    pub height: u32,
+    /// Total coinbase output value in `una` (block reward + fees).
+    pub coinbase_value_una: u64,
+}
+
+/// Miner → pool: Job-Declaration share submission (Phase 5, Dinero
+/// extension).
+///
+/// Identical to `SubmitSharesDinero` (channel/seq/job/nonce/ntime/ver)
+/// plus the miner's chosen coinbase outputs. The pool reconstructs the
+/// full share candidate:
+///
+/// 1. Assemble coinbase = `prefix || varint(|outputs|) || serialize(outputs) || suffix`
+/// 2. `coinbase_txid = sha256d(coinbase_bytes)`
+/// 3. For each output i: `leaf_i = leaf_hash(coinbase_txid, i, value, script)`
+/// 4. `new_state = pre_block_state.add_leaves(&leaves)`, `utreexo_root =
+///    commitment(&new_state)`
+/// 5. `merkle_root = compute_root(coinbase_txid, &merkle_path)`
+/// 6. Assemble 128-byte header with nonce/ntime/version + these
+///    computed fields
+/// 7. Hash = `sha256d(header)`, verify against share_target (and block_target)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubmitSharesExtendedDinero {
+    /// Mining channel on which the share was found.
+    pub channel_id: u32,
+    /// Monotonic share counter; replay prevention.
+    pub sequence_number: u32,
+    /// Which job on that channel (echoes NewMiningJob's template_id).
+    pub job_id: u32,
+    /// Header field: miner nonce.
+    pub nonce: u32,
+    /// Header field: block timestamp (u64 per Dinero).
+    pub timestamp: u64,
+    /// Header field: block version.
+    pub version: u32,
+    /// Miner-chosen coinbase outputs as `(value_una, script_pubkey)`
+    /// tuples. Serialization order must match the miner's local
+    /// coinbase assembly or the pool's recomputed hash will diverge.
+    pub coinbase_outputs: Vec<CoinbaseOutputWire>,
+}
+
+/// Wire-shape for a single coinbase output. Lives in
+/// `dinero-sv2-common` so the codec crate can decode it without
+/// depending on `dinero-sv2-jd`. It's the same struct shape as
+/// `dinero_sv2_jd::CoinbaseOutput`, just re-declared here to keep the
+/// layering clean (sv2-jd can `impl From` both ways if needed later).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoinbaseOutputWire {
+    /// Output value in `una`.
+    pub value_una: u64,
+    /// Raw scriptPubKey bytes.
+    pub script_pubkey: Vec<u8>,
+}
+
 /// Pool → miner: tip changed.
 ///
 /// Sent *before* the next `NewMiningJob`. Miners MUST treat any

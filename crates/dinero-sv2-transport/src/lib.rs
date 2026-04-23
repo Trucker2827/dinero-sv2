@@ -62,6 +62,18 @@ pub const MSG_SET_NEW_PREV_HASH: u8 = 0x20;
 /// [`MSG_NEW_MINING_JOB`].
 pub const MSG_UTREEXO_STATE: u8 = 0x21;
 
+/// Mining (Dinero extension): `CoinbaseContext` — coinbase prefix +
+/// suffix + merkle path + height + value. Sent between
+/// [`MSG_UTREEXO_STATE`] and [`MSG_NEW_MINING_JOB`] on JD-capable
+/// channels so miners can assemble their own coinbase.
+pub const MSG_COINBASE_CONTEXT: u8 = 0x17;
+
+/// Mining: `SubmitSharesExtended` (miner → pool, Phase 5). Carries
+/// the standard share fields plus the miner's chosen coinbase
+/// outputs. Pool rebuilds the coinbase from template prefix/suffix +
+/// outputs and verifies the resulting header hash.
+pub const MSG_SUBMIT_SHARES_EXTENDED: u8 = 0x1B;
+
 /// Mining: `SubmitSharesStandard` (miner → pool). Payload is the
 /// fixed-size `SubmitSharesDinero`.
 pub const MSG_SUBMIT_SHARES_STANDARD: u8 = 0x1A;

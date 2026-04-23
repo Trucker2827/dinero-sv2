@@ -24,17 +24,24 @@ pub fn assemble_block_hex(
     share: &SubmitSharesDinero,
     coinbase_full_hex: &str,
 ) -> Result<String> {
-    let header = HeaderAssembly::bytes(template, share);
     let coinbase = hex::decode(coinbase_full_hex).context("coinbase hex")?;
+    assemble_block_hex_raw(template, share, &coinbase)
+}
 
-    // tx_count varint: always 1 in Phase 4 (empty mempool).
+/// Like [`assemble_block_hex`] but takes raw coinbase bytes. Used by
+/// Phase-5 extended-share submission where the pool rebuilds the
+/// coinbase on its own rather than using the daemon's verbatim hex.
+pub fn assemble_block_hex_raw(
+    template: &NewTemplateDinero,
+    share: &SubmitSharesDinero,
+    coinbase_bytes: &[u8],
+) -> Result<String> {
+    let header = HeaderAssembly::bytes(template, share);
     let varint = [0x01u8];
-
-    let mut buf = Vec::with_capacity(header.len() + varint.len() + coinbase.len());
+    let mut buf = Vec::with_capacity(header.len() + varint.len() + coinbase_bytes.len());
     buf.extend_from_slice(&header);
     buf.extend_from_slice(&varint);
-    buf.extend_from_slice(&coinbase);
-
+    buf.extend_from_slice(coinbase_bytes);
     Ok(hex::encode(buf))
 }
 
