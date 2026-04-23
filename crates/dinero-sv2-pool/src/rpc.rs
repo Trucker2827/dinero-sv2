@@ -120,17 +120,35 @@ impl RpcClient {
         self.call("getutreexoroots", serde_json::json!([])).await
     }
 
-    /// Submit a serialized block (hex). Accepted = result field is null.
+    /// Submit a serialized block (hex).
+    ///
+    /// Dinero's `submitblock` returns `null` on acceptance (BIP22) but
+    /// some handlers in the daemon emit an empty object `{}` instead.
+    /// Both are treated as success. Rejections always carry an
+    /// `error` (and usually a `code`) field in the result object.
     pub async fn submit_block(&self, block_hex: &str) -> Result<SubmitBlockResult> {
         let v = self
             .call("submitblock", serde_json::json!([block_hex]))
             .await?;
         if v.is_null() {
-            Ok(SubmitBlockResult::Accepted)
-        } else if let Some(s) = v.as_str() {
-            Ok(SubmitBlockResult::Rejected(s.to_string()))
-        } else {
-            Ok(SubmitBlockResult::Rejected(v.to_string()))
+            return Ok(SubmitBlockResult::Accepted);
         }
+        if let Some(s) = v.as_str() {
+            return Ok(SubmitBlockResult::Rejected(s.to_string()));
+        }
+        if let Some(obj) = v.as_object() {
+            let has_error = obj
+                .get("error")
+                .map(|e| !e.is_null())
+                .unwrap_or(false);
+            let has_code = obj
+                .get("code")
+                .map(|c| !c.is_null())
+                .unwrap_or(false);
+            if !has_error && !has_code {
+                return Ok(SubmitBlockResult::Accepted);
+            }
+        }
+        Ok(SubmitBlockResult::Rejected(v.to_string()))
     }
 }
