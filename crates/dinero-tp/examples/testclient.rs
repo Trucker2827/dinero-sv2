@@ -27,8 +27,11 @@ use dinero_sv2_common::{
     PROTOCOL_VERSION,
 };
 use dinero_sv2_jd::{
-    assemble_stripped_coinbase, commitment as utreexo_commitment, compute_root,
-    decode_utreexo_accumulator_state, leaf_hash, CoinbaseOutput, UtreexoAccumulatorState,
+    assemble_stripped_coinbase,
+    block_filter::{gcs_build, gcs_filter_hash},
+    commitment as utreexo_commitment, compute_root, decode_utreexo_accumulator_state,
+    filter_commitment::{build_dnrf_script, requires_filter_commitment},
+    leaf_hash, CoinbaseOutput, UtreexoAccumulatorState,
 };
 use dinero_sv2_transport::{
     Frame, NoiseSession, MSG_COINBASE_CONTEXT, MSG_NEW_MINING_JOB,
@@ -366,17 +369,41 @@ async fn submit_extended_share(
         }
     };
 
-    // Single output paying the entire coinbase value to our chosen
-    // payout script.
-    let miner_outputs = vec![CoinbaseOutput {
+    // The miner's outputs are:
+    //   [0] payout (Taproot or caller-supplied script), value = coinbase reward.
+    //   [1] DNRF filter commitment OP_RETURN, value = 0 una.
+    //       Mandatory from height ACTIVATION_HEIGHT (= 1) onwards; the
+    //       daemon's ConnectTip rejects blocks without it.
+    //
+    // The GCS filter is built over the block's non-OP_RETURN
+    // scriptPubKeys, keyed by prev_block_hash. For a coinbase-only
+    // block that's just the payout script. Spent input scripts are
+    // none (coinbase has null prevout, no non-coinbase txs).
+    //
+    // The filter_hash ( SHA256d(encoded) ) goes verbatim into the
+    // 39-byte DNRF OP_RETURN. See `block_filter` + `filter_commitment`
+    // modules for the byte-level spec.
+    let (encoded, _n) = gcs_build(&tmpl.prev_block_hash, &[&payout_script]);
+    let filter_hash = gcs_filter_hash(&encoded);
+    let dnrf_script = build_dnrf_script(&filter_hash);
+
+    let mut miner_outputs = vec![CoinbaseOutput {
         value_una: ctx.coinbase_value_una,
         script_pubkey: payout_script.clone(),
     }];
+    if requires_filter_commitment(ctx.height as u64) {
+        miner_outputs.push(CoinbaseOutput {
+            value_una: 0,
+            script_pubkey: dnrf_script,
+        });
+    }
 
     let (_coinbase_bytes, coinbase_txid) =
         assemble_stripped_coinbase(&ctx.coinbase_prefix, &miner_outputs, &ctx.coinbase_suffix);
 
-    // Apply our one coinbase output's leaf to the pre-block state.
+    // Apply every coinbase output leaf (including the DNRF OP_RETURN)
+    // to the pre-block state. Dinero's utreexo tracks all outputs,
+    // spendable or not.
     let mut post_state = pre_block_state.clone();
     for (i, out) in miner_outputs.iter().enumerate() {
         let leaf = leaf_hash(&coinbase_txid, i as u32, out.value_una, &out.script_pubkey);
@@ -416,10 +443,13 @@ async fn submit_extended_share(
         nonce,
         timestamp: tmpl.timestamp,
         version: tmpl.version,
-        coinbase_outputs: vec![CoinbaseOutputWire {
-            value_una: miner_outputs[0].value_una,
-            script_pubkey: miner_outputs[0].script_pubkey.clone(),
-        }],
+        coinbase_outputs: miner_outputs
+            .iter()
+            .map(|o| CoinbaseOutputWire {
+                value_una: o.value_una,
+                script_pubkey: o.script_pubkey.clone(),
+            })
+            .collect(),
     };
     let buf = encode_submit_shares_extended(&ext)?;
     session

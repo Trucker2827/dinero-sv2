@@ -28,8 +28,10 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod block_filter;
 pub mod codec;
 pub mod coinbase;
+pub mod filter_commitment;
 pub mod merkle;
 pub mod messages;
 pub mod utreexo;
