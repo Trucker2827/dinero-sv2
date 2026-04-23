@@ -440,6 +440,9 @@ async fn side_chain_tampered_utreexo_root() -> Result<()> {
             Ok(())
         }
         SubmitBlockResult::Accepted => {
+            // Kept as a belt-and-suspenders path in case the
+            // fork-aware check ever regresses: the test will at
+            // least fail loudly rather than silently passing.
             eprintln!(
                 "side-chain tampered block was ACCEPTED at submit time — \
                  daemon has stored a block with a known-bad utreexo_root"
