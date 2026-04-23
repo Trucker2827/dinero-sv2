@@ -21,18 +21,30 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use clap::Parser;
 use dinero_sv2_codec::{
-    decode_submit_shares, encode_new_template, NEW_TEMPLATE_DINERO_SIZE, SUBMIT_SHARES_DINERO_SIZE,
+    decode_open_standard_mining_channel, decode_setup_connection, decode_submit_shares,
+    encode_new_template, encode_open_standard_mining_channel_error,
+    encode_open_standard_mining_channel_success, encode_setup_connection_error,
+    encode_setup_connection_success, encode_submit_shares_error, encode_submit_shares_success,
+    NEW_TEMPLATE_DINERO_SIZE, SUBMIT_SHARES_DINERO_SIZE,
 };
-use dinero_sv2_common::{HeaderAssembly, NewTemplateDinero};
+use dinero_sv2_common::{
+    HeaderAssembly, NewTemplateDinero, OpenStandardMiningChannelError,
+    OpenStandardMiningChannelSuccess, SetupConnectionError, SetupConnectionSuccess,
+    SubmitSharesError, SubmitSharesSuccess, PROTOCOL_MINING, PROTOCOL_VERSION,
+};
 use dinero_sv2_transport::{
-    Frame, NoiseSession, StaticKeys, ACK_BAD_SHAPE, ACK_OK, ACK_UNDER_TARGET, MSG_NEW_TEMPLATE,
-    MSG_SHARE_ACK, MSG_SUBMIT_SHARES,
+    Frame, NoiseSession, StaticKeys, MSG_NEW_MINING_JOB, MSG_OPEN_STANDARD_MINING_CHANNEL,
+    MSG_OPEN_STANDARD_MINING_CHANNEL_ERROR, MSG_OPEN_STANDARD_MINING_CHANNEL_SUCCESS,
+    MSG_SETUP_CONNECTION, MSG_SETUP_CONNECTION_ERROR, MSG_SETUP_CONNECTION_SUCCESS,
+    MSG_SUBMIT_SHARES_ERROR, MSG_SUBMIT_SHARES_STANDARD, MSG_SUBMIT_SHARES_SUCCESS,
 };
 use std::path::PathBuf;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
+
+const DEFAULT_CHANNEL_ID: u32 = 1;
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -170,7 +182,100 @@ async fn serve_client<S: AsyncRead + AsyncWrite + Unpin>(
     mut rx: watch::Receiver<Option<NewTemplateDinero>>,
     leading: u8,
 ) -> Result<()> {
+    // Phase A: SetupConnection
+    let f = session
+        .read_frame()
+        .await?
+        .context("EOF before SetupConnection")?;
+    if f.msg_type != MSG_SETUP_CONNECTION {
+        warn!(msg_type = f.msg_type, "expected SetupConnection");
+        return Ok(());
+    }
+    let setup = match decode_setup_connection(&f.payload) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(error = %e, "bad SetupConnection payload");
+            let err = SetupConnectionError {
+                flags: 0,
+                error_code: b"invalid-payload".to_vec(),
+            };
+            session
+                .write_frame(
+                    MSG_SETUP_CONNECTION_ERROR,
+                    &encode_setup_connection_error(&err)?,
+                )
+                .await?;
+            return Ok(());
+        }
+    };
+    if setup.protocol != PROTOCOL_MINING
+        || PROTOCOL_VERSION < setup.min_version
+        || PROTOCOL_VERSION > setup.max_version
+    {
+        let err = SetupConnectionError {
+            flags: 0,
+            error_code: b"version-incompatible".to_vec(),
+        };
+        session
+            .write_frame(
+                MSG_SETUP_CONNECTION_ERROR,
+                &encode_setup_connection_error(&err)?,
+            )
+            .await?;
+        return Ok(());
+    }
+    session
+        .write_frame(
+            MSG_SETUP_CONNECTION_SUCCESS,
+            &encode_setup_connection_success(&SetupConnectionSuccess {
+                used_version: PROTOCOL_VERSION,
+                flags: 0,
+            }),
+        )
+        .await?;
+
+    // Phase B: OpenStandardMiningChannel
+    let f = session
+        .read_frame()
+        .await?
+        .context("EOF before OpenStandardMiningChannel")?;
+    if f.msg_type != MSG_OPEN_STANDARD_MINING_CHANNEL {
+        warn!(msg_type = f.msg_type, "expected OpenStandardMiningChannel");
+        return Ok(());
+    }
+    let open = match decode_open_standard_mining_channel(&f.payload) {
+        Ok(o) => o,
+        Err(e) => {
+            warn!(error = %e, "bad OpenStandardMiningChannel payload");
+            let err = OpenStandardMiningChannelError {
+                request_id: 0,
+                error_code: b"invalid-payload".to_vec(),
+            };
+            session
+                .write_frame(
+                    MSG_OPEN_STANDARD_MINING_CHANNEL_ERROR,
+                    &encode_open_standard_mining_channel_error(&err)?,
+                )
+                .await?;
+            return Ok(());
+        }
+    };
+    let channel_id = DEFAULT_CHANNEL_ID;
+    let target = leading_zero_target(leading);
+    session
+        .write_frame(
+            MSG_OPEN_STANDARD_MINING_CHANNEL_SUCCESS,
+            &encode_open_standard_mining_channel_success(&OpenStandardMiningChannelSuccess {
+                request_id: open.request_id,
+                channel_id,
+                target,
+            }),
+        )
+        .await?;
+
+    // Phase C: normal operation
     let mut current: Option<NewTemplateDinero> = None;
+    let mut last_sequence_number: u32 = 0;
 
     let initial = rx.borrow_and_update().clone();
     if let Some(t) = initial {
@@ -200,8 +305,16 @@ async fn serve_client<S: AsyncRead + AsyncWrite + Unpin>(
                 };
                 let Frame { msg_type, payload, .. } = f;
                 match msg_type {
-                    MSG_SUBMIT_SHARES => {
-                        handle_submit_shares(&mut session, &payload, current.as_ref(), leading).await?;
+                    MSG_SUBMIT_SHARES_STANDARD => {
+                        handle_submit_shares(
+                            &mut session,
+                            &payload,
+                            current.as_ref(),
+                            leading,
+                            channel_id,
+                            &mut last_sequence_number,
+                        )
+                        .await?;
                     }
                     other => warn!(msg_type = other, "unexpected msg from client"),
                 }
@@ -215,8 +328,8 @@ async fn send_template<S: AsyncRead + AsyncWrite + Unpin>(
     tmpl: &NewTemplateDinero,
 ) -> Result<()> {
     let payload = encode_new_template(tmpl);
-    session.write_frame(MSG_NEW_TEMPLATE, &payload).await?;
-    debug!(id = tmpl.template_id, "sent template");
+    session.write_frame(MSG_NEW_MINING_JOB, &payload).await?;
+    debug!(id = tmpl.template_id, "sent mining job");
     Ok(())
 }
 
@@ -225,18 +338,36 @@ async fn handle_submit_shares<S: AsyncRead + AsyncWrite + Unpin>(
     payload: &[u8],
     current: Option<&NewTemplateDinero>,
     leading: u8,
+    channel_id: u32,
+    last_sequence_number: &mut u32,
 ) -> Result<()> {
     let share = match decode_submit_shares(payload) {
         Ok(s) => s,
         Err(e) => {
             warn!(error = %e, "bad share shape");
-            session.write_frame(MSG_SHARE_ACK, &[ACK_BAD_SHAPE]).await?;
+            let err = SubmitSharesError {
+                channel_id,
+                sequence_number: *last_sequence_number,
+                error_code: b"invalid-payload".to_vec(),
+            };
+            session
+                .write_frame(MSG_SUBMIT_SHARES_ERROR, &encode_submit_shares_error(&err)?)
+                .await?;
             return Ok(());
         }
     };
+    *last_sequence_number = share.sequence_number;
+
     let Some(tmpl) = current else {
         warn!("share received before any template was sent");
-        session.write_frame(MSG_SHARE_ACK, &[ACK_BAD_SHAPE]).await?;
+        let err = SubmitSharesError {
+            channel_id,
+            sequence_number: share.sequence_number,
+            error_code: b"no-template".to_vec(),
+        };
+        session
+            .write_frame(MSG_SUBMIT_SHARES_ERROR, &encode_submit_shares_error(&err)?)
+            .await?;
         return Ok(());
     };
     let hash = HeaderAssembly::hash(tmpl, &share);
@@ -248,18 +379,53 @@ async fn handle_submit_shares<S: AsyncRead + AsyncWrite + Unpin>(
             nonce = share.nonce,
             "accepted share"
         );
-        session.write_frame(MSG_SHARE_ACK, &[ACK_OK]).await?;
+        session
+            .write_frame(
+                MSG_SUBMIT_SHARES_SUCCESS,
+                &encode_submit_shares_success(&SubmitSharesSuccess {
+                    channel_id,
+                    last_sequence_number: share.sequence_number,
+                    new_submits_accepted_count: 1,
+                    new_shares_sum: 1,
+                }),
+            )
+            .await?;
     } else {
         debug!(
             hash = %hex::encode(hash),
             leading,
             "share under target"
         );
+        let err = SubmitSharesError {
+            channel_id,
+            sequence_number: share.sequence_number,
+            error_code: b"under-target".to_vec(),
+        };
         session
-            .write_frame(MSG_SHARE_ACK, &[ACK_UNDER_TARGET])
+            .write_frame(MSG_SUBMIT_SHARES_ERROR, &encode_submit_shares_error(&err)?)
             .await?;
     }
     Ok(())
+}
+
+/// Build a 32-byte big-endian target with `bits` leading zero bits.
+fn leading_zero_target(bits: u8) -> [u8; 32] {
+    let mut target = [0xFFu8; 32];
+    if bits == 0 {
+        return target;
+    }
+    if bits == u8::MAX {
+        return [0u8; 32];
+    }
+    let full = (bits / 8) as usize;
+    let rem = bits % 8;
+    for b in target.iter_mut().take(full) {
+        *b = 0;
+    }
+    if rem > 0 {
+        target[full] = 0xFFu8 >> rem;
+    }
+    target
 }
 
 fn meets_leading_zero_bits(hash: &[u8; 32], bits: u8) -> bool {
@@ -291,13 +457,19 @@ const _: () = {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dinero_sv2_codec::encode_submit_shares;
-    use dinero_sv2_common::SubmitSharesDinero;
+    use dinero_sv2_codec::{
+        decode_open_standard_mining_channel_success, decode_setup_connection_success,
+        encode_open_standard_mining_channel, encode_setup_connection, encode_submit_shares,
+    };
+    use dinero_sv2_common::{
+        OpenStandardMiningChannel, SetupConnection, SubmitSharesDinero, PROTOCOL_MINING,
+        PROTOCOL_VERSION,
+    };
 
-    fn fixture_share(nonce: u32, ts: u64) -> SubmitSharesDinero {
+    fn fixture_share(nonce: u32, ts: u64, channel_id: u32) -> SubmitSharesDinero {
         SubmitSharesDinero {
-            channel_id: 7,
-            sequence_number: 0,
+            channel_id,
+            sequence_number: 1,
             job_id: 1,
             nonce,
             timestamp: ts,
@@ -305,10 +477,50 @@ mod tests {
         }
     }
 
+    /// Drive a fresh client through SetupConnection + OpenStandardMiningChannel
+    /// and return the assigned channel_id. Panics on unexpected response.
+    async fn handshake_as_initiator<S: AsyncRead + AsyncWrite + Unpin>(
+        client: &mut NoiseSession<S>,
+    ) -> u32 {
+        let setup = SetupConnection {
+            protocol: PROTOCOL_MINING,
+            min_version: PROTOCOL_VERSION,
+            max_version: PROTOCOL_VERSION,
+            flags: 0,
+            user_agent: b"tp-sim-test".to_vec(),
+        };
+        client
+            .write_frame(
+                MSG_SETUP_CONNECTION,
+                &encode_setup_connection(&setup).unwrap(),
+            )
+            .await
+            .unwrap();
+        let f = client.read_frame().await.unwrap().unwrap();
+        assert_eq!(f.msg_type, MSG_SETUP_CONNECTION_SUCCESS);
+        let _ = decode_setup_connection_success(&f.payload).unwrap();
+
+        let open = OpenStandardMiningChannel {
+            request_id: 1,
+            user_identity: b"w1".to_vec(),
+            nominal_hash_rate_bits: f32::to_bits(1.0),
+            max_target: [0xFFu8; 32],
+        };
+        client
+            .write_frame(
+                MSG_OPEN_STANDARD_MINING_CHANNEL,
+                &encode_open_standard_mining_channel(&open).unwrap(),
+            )
+            .await
+            .unwrap();
+        let f = client.read_frame().await.unwrap().unwrap();
+        assert_eq!(f.msg_type, MSG_OPEN_STANDARD_MINING_CHANNEL_SUCCESS);
+        let succ = decode_open_standard_mining_channel_success(&f.payload).unwrap();
+        succ.channel_id
+    }
+
     #[tokio::test]
     async fn client_receives_template_and_share_is_acked() {
-        // Run the whole session over an in-memory duplex pipe so Noise
-        // can wrap both sides end-to-end without the TCP round-trip.
         let (server_io, client_io) = tokio::io::duplex(16_384);
         let keys = StaticKeys::generate().unwrap();
         let server_pub = keys.public;
@@ -327,35 +539,31 @@ mod tests {
         let mut client = NoiseSession::initiate_nx(client_io, Some(&server_pub))
             .await
             .unwrap();
+        let channel_id = handshake_as_initiator(&mut client).await;
 
-        // Receive a NewTemplate frame.
+        // Receive the mining job frame.
         let Frame {
             msg_type: mtype,
             payload,
             ..
         } = client.read_frame().await.unwrap().unwrap();
-        assert_eq!(mtype, MSG_NEW_TEMPLATE);
+        assert_eq!(mtype, MSG_NEW_MINING_JOB);
         assert_eq!(payload.len(), NEW_TEMPLATE_DINERO_SIZE);
 
-        // Submit a share — with leading=0 the sim accepts everything.
-        let share = fixture_share(0x1234_5678, tmpl.timestamp);
+        // Submit a share — leading=0 → target is 0xFF..FF → everything accepted.
+        let share = fixture_share(0x1234_5678, tmpl.timestamp, channel_id);
         let share_buf = encode_submit_shares(&share);
         client
-            .write_frame(MSG_SUBMIT_SHARES, &share_buf)
+            .write_frame(MSG_SUBMIT_SHARES_STANDARD, &share_buf)
             .await
             .unwrap();
 
-        let Frame {
-            msg_type: mtype,
-            payload,
-            ..
-        } = client.read_frame().await.unwrap().unwrap();
-        assert_eq!(mtype, MSG_SHARE_ACK);
-        assert_eq!(payload, vec![ACK_OK]);
+        let f = client.read_frame().await.unwrap().unwrap();
+        assert_eq!(f.msg_type, MSG_SUBMIT_SHARES_SUCCESS);
     }
 
     #[tokio::test]
-    async fn malformed_share_gets_bad_shape_ack() {
+    async fn malformed_share_gets_error_message() {
         let (server_io, client_io) = tokio::io::duplex(16_384);
         let keys = StaticKeys::generate().unwrap();
         let server_pub = keys.public;
@@ -374,21 +582,17 @@ mod tests {
         let mut client = NoiseSession::initiate_nx(client_io, Some(&server_pub))
             .await
             .unwrap();
-        // Drain the initial template frame.
+        let _channel_id = handshake_as_initiator(&mut client).await;
+        // Drain the initial mining-job frame.
         let _ = client.read_frame().await.unwrap().unwrap();
 
-        // Send short share payload.
+        // Send a truncated share payload.
         client
-            .write_frame(MSG_SUBMIT_SHARES, &[0u8; 10])
+            .write_frame(MSG_SUBMIT_SHARES_STANDARD, &[0u8; 10])
             .await
             .unwrap();
-        let Frame {
-            msg_type: mtype,
-            payload,
-            ..
-        } = client.read_frame().await.unwrap().unwrap();
-        assert_eq!(mtype, MSG_SHARE_ACK);
-        assert_eq!(payload, vec![ACK_BAD_SHAPE]);
+        let f = client.read_frame().await.unwrap().unwrap();
+        assert_eq!(f.msg_type, MSG_SUBMIT_SHARES_ERROR);
     }
 
     #[test]

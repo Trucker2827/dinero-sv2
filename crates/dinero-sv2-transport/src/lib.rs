@@ -29,18 +29,31 @@ pub mod noise;
 pub use keys::StaticKeys;
 pub use noise::{Frame, NoiseSession, EXT_BASIC, NOISE_MAX_PAYLOAD};
 
-/// Message type: server → client, a new `NewTemplateDinero` payload.
-pub const MSG_NEW_TEMPLATE: u8 = 0x01;
+// SV2-aligned message types. Numbers mirror the Stratum V2 spec's
+// Common / Mining extension codes where applicable.
 
-/// Message type: client → server, a `SubmitSharesDinero` payload.
-pub const MSG_SUBMIT_SHARES: u8 = 0x02;
+/// Common: `SetupConnection` (miner → pool).
+pub const MSG_SETUP_CONNECTION: u8 = 0x00;
+/// Common: `SetupConnection.Success` (pool → miner).
+pub const MSG_SETUP_CONNECTION_SUCCESS: u8 = 0x01;
+/// Common: `SetupConnection.Error` (pool → miner).
+pub const MSG_SETUP_CONNECTION_ERROR: u8 = 0x02;
 
-/// Message type: server → client, a 1-byte share-ack response.
-pub const MSG_SHARE_ACK: u8 = 0x03;
+/// Mining: `OpenStandardMiningChannel` (miner → pool).
+pub const MSG_OPEN_STANDARD_MINING_CHANNEL: u8 = 0x10;
+/// Mining: `OpenStandardMiningChannel.Success` (pool → miner).
+pub const MSG_OPEN_STANDARD_MINING_CHANNEL_SUCCESS: u8 = 0x11;
+/// Mining: `OpenStandardMiningChannel.Error` (pool → miner).
+pub const MSG_OPEN_STANDARD_MINING_CHANNEL_ERROR: u8 = 0x12;
 
-/// Share ack: share accepted (meets target, if any).
-pub const ACK_OK: u8 = 0x00;
-/// Share ack: payload did not decode cleanly.
-pub const ACK_BAD_SHAPE: u8 = 0x01;
-/// Share ack: valid share but under the configured target.
-pub const ACK_UNDER_TARGET: u8 = 0x02;
+/// Mining: `NewMiningJob` — carries a `NewTemplateDinero` payload
+/// after channel-open completes (pool → miner).
+pub const MSG_NEW_MINING_JOB: u8 = 0x15;
+
+/// Mining: `SubmitSharesStandard` (miner → pool). Payload is the
+/// fixed-size `SubmitSharesDinero`.
+pub const MSG_SUBMIT_SHARES_STANDARD: u8 = 0x1A;
+/// Mining: `SubmitShares.Success` (pool → miner).
+pub const MSG_SUBMIT_SHARES_SUCCESS: u8 = 0x1C;
+/// Mining: `SubmitShares.Error` (pool → miner).
+pub const MSG_SUBMIT_SHARES_ERROR: u8 = 0x1D;

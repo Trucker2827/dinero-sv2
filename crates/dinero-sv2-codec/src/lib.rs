@@ -10,6 +10,18 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod sv2;
+
+pub use sv2::{
+    decode_open_standard_mining_channel, decode_open_standard_mining_channel_error,
+    decode_open_standard_mining_channel_success, decode_setup_connection,
+    decode_setup_connection_error, decode_setup_connection_success, decode_submit_shares_error,
+    decode_submit_shares_success, encode_open_standard_mining_channel,
+    encode_open_standard_mining_channel_error, encode_open_standard_mining_channel_success,
+    encode_setup_connection, encode_setup_connection_error, encode_setup_connection_success,
+    encode_submit_shares_error, encode_submit_shares_success, Sv2CodecError,
+};
+
 use dinero_sv2_common::{NewTemplateDinero, SubmitSharesDinero};
 
 /// Wire size (bytes) of a [`NewTemplateDinero`] frame.

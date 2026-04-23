@@ -26,11 +26,22 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use dinero_sv2_codec::{decode_submit_shares, encode_new_template};
-use dinero_sv2_common::{HeaderAssembly, SubmitSharesDinero};
+use dinero_sv2_codec::{
+    decode_open_standard_mining_channel, decode_setup_connection, decode_submit_shares,
+    encode_new_template, encode_open_standard_mining_channel_error,
+    encode_open_standard_mining_channel_success, encode_setup_connection_error,
+    encode_setup_connection_success, encode_submit_shares_error, encode_submit_shares_success,
+};
+use dinero_sv2_common::{
+    HeaderAssembly, OpenStandardMiningChannelError, OpenStandardMiningChannelSuccess,
+    SetupConnectionError, SetupConnectionSuccess, SubmitSharesDinero, SubmitSharesError,
+    SubmitSharesSuccess, PROTOCOL_MINING, PROTOCOL_VERSION,
+};
 use dinero_sv2_transport::{
-    Frame, NoiseSession, StaticKeys, ACK_BAD_SHAPE, ACK_OK, ACK_UNDER_TARGET, MSG_NEW_TEMPLATE,
-    MSG_SHARE_ACK, MSG_SUBMIT_SHARES,
+    Frame, NoiseSession, StaticKeys, MSG_NEW_MINING_JOB, MSG_OPEN_STANDARD_MINING_CHANNEL,
+    MSG_OPEN_STANDARD_MINING_CHANNEL_ERROR, MSG_OPEN_STANDARD_MINING_CHANNEL_SUCCESS,
+    MSG_SETUP_CONNECTION, MSG_SETUP_CONNECTION_ERROR, MSG_SETUP_CONNECTION_SUCCESS,
+    MSG_SUBMIT_SHARES_ERROR, MSG_SUBMIT_SHARES_STANDARD, MSG_SUBMIT_SHARES_SUCCESS,
 };
 use tokio::net::TcpStream;
 use tokio::sync::watch;
@@ -225,6 +236,10 @@ fn default_pool_key_path() -> PathBuf {
     PathBuf::from(format!("{home}/.dinero/dinero-sv2-pool.key"))
 }
 
+/// Pool-assigned channel id for the single channel per connection that
+/// Pass B supports. Real multi-channel bookkeeping is Pass C material.
+const DEFAULT_CHANNEL_ID: u32 = 1;
+
 async fn serve_miner(
     mut session: NoiseSession<TcpStream>,
     mut rx: watch::Receiver<Option<PoolTemplate>>,
@@ -233,13 +248,144 @@ async fn serve_miner(
     rpc: Arc<RpcClient>,
     ledger: Arc<Ledger>,
 ) -> Result<()> {
+    // ---- Phase A: SetupConnection ----
+    let f = session
+        .read_frame()
+        .await?
+        .context("EOF before SetupConnection")?;
+    if f.msg_type != MSG_SETUP_CONNECTION {
+        warn!(msg_type = f.msg_type, "expected SetupConnection");
+        return Ok(());
+    }
+    let setup = match decode_setup_connection(&f.payload) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(error = %e, "bad SetupConnection payload");
+            let err = SetupConnectionError {
+                flags: 0,
+                error_code: b"invalid-payload".to_vec(),
+            };
+            session
+                .write_frame(
+                    MSG_SETUP_CONNECTION_ERROR,
+                    &encode_setup_connection_error(&err)?,
+                )
+                .await?;
+            return Ok(());
+        }
+    };
+    if setup.protocol != PROTOCOL_MINING {
+        let err = SetupConnectionError {
+            flags: 0,
+            error_code: b"unsupported-protocol".to_vec(),
+        };
+        session
+            .write_frame(
+                MSG_SETUP_CONNECTION_ERROR,
+                &encode_setup_connection_error(&err)?,
+            )
+            .await?;
+        return Ok(());
+    }
+    // Simple range check: PROTOCOL_VERSION must fall within the miner's
+    // declared [min, max]. Otherwise the dialects are incompatible.
+    if PROTOCOL_VERSION < setup.min_version || PROTOCOL_VERSION > setup.max_version {
+        let err = SetupConnectionError {
+            flags: 0,
+            error_code: b"version-incompatible".to_vec(),
+        };
+        session
+            .write_frame(
+                MSG_SETUP_CONNECTION_ERROR,
+                &encode_setup_connection_error(&err)?,
+            )
+            .await?;
+        return Ok(());
+    }
+    session
+        .write_frame(
+            MSG_SETUP_CONNECTION_SUCCESS,
+            &encode_setup_connection_success(&SetupConnectionSuccess {
+                used_version: PROTOCOL_VERSION,
+                flags: 0,
+            }),
+        )
+        .await?;
+    info!(
+        user_agent = %String::from_utf8_lossy(&setup.user_agent),
+        "SetupConnection OK"
+    );
+
+    // ---- Phase B: OpenStandardMiningChannel ----
+    let f = session
+        .read_frame()
+        .await?
+        .context("EOF before OpenStandardMiningChannel")?;
+    if f.msg_type != MSG_OPEN_STANDARD_MINING_CHANNEL {
+        warn!(msg_type = f.msg_type, "expected OpenStandardMiningChannel");
+        return Ok(());
+    }
+    let open = match decode_open_standard_mining_channel(&f.payload) {
+        Ok(o) => o,
+        Err(e) => {
+            warn!(error = %e, "bad OpenStandardMiningChannel payload");
+            let err = OpenStandardMiningChannelError {
+                request_id: 0,
+                error_code: b"invalid-payload".to_vec(),
+            };
+            session
+                .write_frame(
+                    MSG_OPEN_STANDARD_MINING_CHANNEL_ERROR,
+                    &encode_open_standard_mining_channel_error(&err)?,
+                )
+                .await?;
+            return Ok(());
+        }
+    };
+    // Miner's max_target must be ≥ the pool's assigned share target;
+    // otherwise the miner's hardware can't produce shares we'd accept.
+    if open.max_target < share_target {
+        let err = OpenStandardMiningChannelError {
+            request_id: open.request_id,
+            error_code: b"max-target-too-low".to_vec(),
+        };
+        session
+            .write_frame(
+                MSG_OPEN_STANDARD_MINING_CHANNEL_ERROR,
+                &encode_open_standard_mining_channel_error(&err)?,
+            )
+            .await?;
+        return Ok(());
+    }
+    let channel_id = DEFAULT_CHANNEL_ID;
+    session
+        .write_frame(
+            MSG_OPEN_STANDARD_MINING_CHANNEL_SUCCESS,
+            &encode_open_standard_mining_channel_success(&OpenStandardMiningChannelSuccess {
+                request_id: open.request_id,
+                channel_id,
+                target: share_target,
+            }),
+        )
+        .await?;
+    info!(
+        channel_id,
+        user_identity = %String::from_utf8_lossy(&open.user_identity),
+        "channel open"
+    );
+
+    // ---- Phase C: normal operation ----
     let mut current: Option<PoolTemplate> = None;
+    let mut last_sequence_number: u32 = 0;
 
     let initial = rx.borrow_and_update().clone();
     if let Some(pt) = initial {
         let payload = encode_new_template(&pt.wire);
-        session.write_frame(MSG_NEW_TEMPLATE, &payload).await?;
-        debug!(template_id = pt.wire.template_id, "pushed initial template");
+        session.write_frame(MSG_NEW_MINING_JOB, &payload).await?;
+        debug!(
+            template_id = pt.wire.template_id,
+            "pushed initial mining job"
+        );
         current = Some(pt);
     }
 
@@ -254,8 +400,8 @@ async fn serve_miner(
                 let maybe_t = rx.borrow_and_update().clone();
                 if let Some(pt) = maybe_t {
                     let payload = encode_new_template(&pt.wire);
-                    session.write_frame(MSG_NEW_TEMPLATE, &payload).await?;
-                    debug!(template_id = pt.wire.template_id, "pushed template");
+                    session.write_frame(MSG_NEW_MINING_JOB, &payload).await?;
+                    debug!(template_id = pt.wire.template_id, "pushed mining job");
                     current = Some(pt);
                 }
             }
@@ -267,12 +413,14 @@ async fn serve_miner(
                 };
                 let Frame { msg_type: mtype, payload, .. } = f;
                 match mtype {
-                    MSG_SUBMIT_SHARES => {
+                    MSG_SUBMIT_SHARES_STANDARD => {
                         handle_share(
                             &mut session,
                             &payload,
                             current.as_ref(),
                             share_target,
+                            channel_id,
+                            &mut last_sequence_number,
                             miner_key,
                             rpc.as_ref(),
                             ledger.as_ref(),
@@ -286,11 +434,14 @@ async fn serve_miner(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_share(
     session: &mut NoiseSession<TcpStream>,
     payload: &[u8],
     current: Option<&PoolTemplate>,
     share_target: [u8; 32],
+    channel_id: u32,
+    last_sequence_number: &mut u32,
     miner_key: MinerKey,
     rpc: &RpcClient,
     ledger: &Ledger,
@@ -300,14 +451,30 @@ async fn handle_share(
         Err(e) => {
             warn!(error = %e, "bad share shape");
             ledger.reject(miner_key);
-            session.write_frame(MSG_SHARE_ACK, &[ACK_BAD_SHAPE]).await?;
+            let err = SubmitSharesError {
+                channel_id,
+                sequence_number: *last_sequence_number,
+                error_code: b"invalid-payload".to_vec(),
+            };
+            session
+                .write_frame(MSG_SUBMIT_SHARES_ERROR, &encode_submit_shares_error(&err)?)
+                .await?;
             return Ok(());
         }
     };
+    *last_sequence_number = share.sequence_number;
+
     let Some(pt) = current else {
         warn!("share received before any template");
         ledger.reject(miner_key);
-        session.write_frame(MSG_SHARE_ACK, &[ACK_BAD_SHAPE]).await?;
+        let err = SubmitSharesError {
+            channel_id,
+            sequence_number: share.sequence_number,
+            error_code: b"no-template".to_vec(),
+        };
+        session
+            .write_frame(MSG_SUBMIT_SHARES_ERROR, &encode_submit_shares_error(&err)?)
+            .await?;
         return Ok(());
     };
 
@@ -317,8 +484,13 @@ async fn handle_share(
 
     if !meets_share {
         debug!(hash = %hex::encode(hash), "share below share-target");
+        let err = SubmitSharesError {
+            channel_id,
+            sequence_number: share.sequence_number,
+            error_code: b"under-target".to_vec(),
+        };
         session
-            .write_frame(MSG_SHARE_ACK, &[ACK_UNDER_TARGET])
+            .write_frame(MSG_SUBMIT_SHARES_ERROR, &encode_submit_shares_error(&err)?)
             .await?;
         return Ok(());
     }
@@ -330,7 +502,17 @@ async fn handle_share(
         nonce = share.nonce,
         "accepted share"
     );
-    session.write_frame(MSG_SHARE_ACK, &[ACK_OK]).await?;
+    session
+        .write_frame(
+            MSG_SUBMIT_SHARES_SUCCESS,
+            &encode_submit_shares_success(&SubmitSharesSuccess {
+                channel_id,
+                last_sequence_number: share.sequence_number,
+                new_submits_accepted_count: 1,
+                new_shares_sum: 1,
+            }),
+        )
+        .await?;
 
     if meets_block {
         match try_submit_block(&pt.wire, &share, &pt.coinbase_full_hex, rpc).await {

@@ -13,6 +13,14 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod sv2_messages;
+
+pub use sv2_messages::{
+    OpenStandardMiningChannel, OpenStandardMiningChannelError, OpenStandardMiningChannelSuccess,
+    SetupConnection, SetupConnectionError, SetupConnectionSuccess, SubmitSharesError,
+    SubmitSharesSuccess, PROTOCOL_MINING, PROTOCOL_VERSION,
+};
+
 use sha2::{Digest, Sha256};
 
 /// The fixed serialized size of a Dinero block header, in bytes.
