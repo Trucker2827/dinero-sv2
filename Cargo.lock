@@ -376,6 +376,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "dinero-sv2-pool"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "clap",
+ "dinero-sv2-codec",
+ "dinero-sv2-common",
+ "dinero-sv2-transport",
+ "hex",
+ "proptest",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "dinero-sv2-tp-sim"
 version = "0.1.0"
 dependencies = [
