@@ -25,7 +25,7 @@ use dinero_sv2_codec::{
 };
 use dinero_sv2_common::{HeaderAssembly, NewTemplateDinero};
 use dinero_sv2_transport::{
-    NoiseSession, StaticKeys, ACK_BAD_SHAPE, ACK_OK, ACK_UNDER_TARGET, MSG_NEW_TEMPLATE,
+    Frame, NoiseSession, StaticKeys, ACK_BAD_SHAPE, ACK_OK, ACK_UNDER_TARGET, MSG_NEW_TEMPLATE,
     MSG_SHARE_ACK, MSG_SUBMIT_SHARES,
 };
 use std::path::PathBuf;
@@ -194,10 +194,11 @@ async fn serve_client<S: AsyncRead + AsyncWrite + Unpin>(
             }
 
             frame = session.read_frame() => {
-                let (msg_type, payload) = match frame? {
+                let f = match frame? {
                     Some(f) => f,
                     None => return Ok(()),
                 };
+                let Frame { msg_type, payload, .. } = f;
                 match msg_type {
                     MSG_SUBMIT_SHARES => {
                         handle_submit_shares(&mut session, &payload, current.as_ref(), leading).await?;
@@ -328,7 +329,11 @@ mod tests {
             .unwrap();
 
         // Receive a NewTemplate frame.
-        let (mtype, payload) = client.read_frame().await.unwrap().unwrap();
+        let Frame {
+            msg_type: mtype,
+            payload,
+            ..
+        } = client.read_frame().await.unwrap().unwrap();
         assert_eq!(mtype, MSG_NEW_TEMPLATE);
         assert_eq!(payload.len(), NEW_TEMPLATE_DINERO_SIZE);
 
@@ -340,7 +345,11 @@ mod tests {
             .await
             .unwrap();
 
-        let (mtype, payload) = client.read_frame().await.unwrap().unwrap();
+        let Frame {
+            msg_type: mtype,
+            payload,
+            ..
+        } = client.read_frame().await.unwrap().unwrap();
         assert_eq!(mtype, MSG_SHARE_ACK);
         assert_eq!(payload, vec![ACK_OK]);
     }
@@ -373,7 +382,11 @@ mod tests {
             .write_frame(MSG_SUBMIT_SHARES, &[0u8; 10])
             .await
             .unwrap();
-        let (mtype, payload) = client.read_frame().await.unwrap().unwrap();
+        let Frame {
+            msg_type: mtype,
+            payload,
+            ..
+        } = client.read_frame().await.unwrap().unwrap();
         assert_eq!(mtype, MSG_SHARE_ACK);
         assert_eq!(payload, vec![ACK_BAD_SHAPE]);
     }

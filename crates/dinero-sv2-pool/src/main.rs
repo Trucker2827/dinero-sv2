@@ -29,7 +29,7 @@ use clap::Parser;
 use dinero_sv2_codec::{decode_submit_shares, encode_new_template};
 use dinero_sv2_common::{HeaderAssembly, SubmitSharesDinero};
 use dinero_sv2_transport::{
-    NoiseSession, StaticKeys, ACK_BAD_SHAPE, ACK_OK, ACK_UNDER_TARGET, MSG_NEW_TEMPLATE,
+    Frame, NoiseSession, StaticKeys, ACK_BAD_SHAPE, ACK_OK, ACK_UNDER_TARGET, MSG_NEW_TEMPLATE,
     MSG_SHARE_ACK, MSG_SUBMIT_SHARES,
 };
 use tokio::net::TcpStream;
@@ -261,10 +261,11 @@ async fn serve_miner(
             }
 
             frame = session.read_frame() => {
-                let (mtype, payload) = match frame? {
+                let f = match frame? {
                     Some(f) => f,
                     None => return Ok(()),
                 };
+                let Frame { msg_type: mtype, payload, .. } = f;
                 match mtype {
                     MSG_SUBMIT_SHARES => {
                         handle_share(

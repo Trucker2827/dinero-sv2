@@ -13,7 +13,9 @@ use anyhow::Result;
 use clap::Parser;
 use dinero_sv2_codec::{decode_new_template, encode_submit_shares};
 use dinero_sv2_common::SubmitSharesDinero;
-use dinero_sv2_transport::{NoiseSession, MSG_NEW_TEMPLATE, MSG_SHARE_ACK, MSG_SUBMIT_SHARES};
+use dinero_sv2_transport::{
+    Frame, NoiseSession, MSG_NEW_TEMPLATE, MSG_SHARE_ACK, MSG_SUBMIT_SHARES,
+};
 use std::net::SocketAddr;
 use tokio::net::TcpStream;
 
@@ -52,7 +54,11 @@ async fn main() -> Result<()> {
         hex::encode(session.peer_static_key())
     );
 
-    let (mtype, payload) = session
+    let Frame {
+        msg_type: mtype,
+        payload,
+        ..
+    } = session
         .read_frame()
         .await?
         .ok_or_else(|| anyhow::anyhow!("no template frame"))?;
@@ -79,7 +85,11 @@ async fn main() -> Result<()> {
     let buf = encode_submit_shares(&share);
     session.write_frame(MSG_SUBMIT_SHARES, &buf).await?;
 
-    let (mtype, payload) = session
+    let Frame {
+        msg_type: mtype,
+        payload,
+        ..
+    } = session
         .read_frame()
         .await?
         .ok_or_else(|| anyhow::anyhow!("no ack"))?;
