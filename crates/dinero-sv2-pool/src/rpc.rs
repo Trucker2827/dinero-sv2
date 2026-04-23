@@ -72,6 +72,12 @@ impl RpcClient {
         })
     }
 
+    /// Generic JSON-RPC call. Public mainly so integration tests can
+    /// reach RPC methods the pool doesn't wrap natively.
+    pub async fn call_raw(&self, method: &str, params: Value) -> Result<Value> {
+        self.call(method, params).await
+    }
+
     async fn call<P: Serialize>(&self, method: &str, params: P) -> Result<Value> {
         let req = Request {
             jsonrpc: "1.0",

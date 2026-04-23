@@ -13,11 +13,7 @@
 //! no persistent share ledger. See crate docs in
 //! `~/.claude/plans/lovely-chasing-puzzle.md` for the longer roadmap.
 
-mod accounting;
-mod block;
-mod mapper;
-mod rpc;
-mod target;
+use dinero_sv2_pool::{accounting, block, mapper, rpc, target};
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
