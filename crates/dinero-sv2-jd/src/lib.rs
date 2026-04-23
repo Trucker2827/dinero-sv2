@@ -32,8 +32,13 @@ pub mod codec;
 pub mod coinbase;
 pub mod merkle;
 pub mod messages;
+pub mod utreexo;
 
-pub use codec::{decode_new_template_jd, encode_new_template_jd, JdCodecError};
+pub use codec::{
+    decode_new_template_jd, decode_utreexo_accumulator_state, encode_new_template_jd,
+    encode_utreexo_accumulator_state, JdCodecError,
+};
 pub use coinbase::{assemble_stripped_coinbase, CoinbaseOutput, CoinbaseOutputs};
 pub use merkle::{compute_root, MerkleError, MerklePath};
 pub use messages::NewTemplateDineroJD;
+pub use utreexo::{commitment_placeholder, UtreexoAccumulatorState, UtreexoError};

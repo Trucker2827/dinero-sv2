@@ -29,9 +29,14 @@
 //! obviously enough for any real block).
 
 use crate::messages::NewTemplateDineroJD;
+use crate::utreexo::UtreexoAccumulatorState;
 
 const MAX_COINBASE_BLOB: usize = 1_048_576;
 const MAX_MERKLE_ENTRIES: usize = 64;
+/// Hard cap on Utreexo forest roots carried in a single frame.
+/// 64 roots covers `num_leaves` up to 2^64 — more than any real chain
+/// will ever hit, but the bound keeps the wire size predictable.
+const MAX_UTREEXO_ROOTS: usize = 64;
 
 /// Codec errors for JD messages.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -197,6 +202,65 @@ pub fn decode_new_template_jd(buf: &[u8]) -> Result<NewTemplateDineroJD, JdCodec
     })
 }
 
+// ----------------------- UtreexoAccumulatorState -----------------------
+
+/// Wire layout for a [`UtreexoAccumulatorState`]:
+/// ```text
+/// forest_roots_len  u16 LE  (≤ 64)
+/// forest_roots      len * 32 bytes
+/// num_leaves        u64 LE
+/// ```
+pub fn encode_utreexo_accumulator_state(
+    state: &UtreexoAccumulatorState,
+) -> Result<Vec<u8>, JdCodecError> {
+    if state.forest_roots.len() > MAX_UTREEXO_ROOTS {
+        return Err(JdCodecError::TooLarge {
+            field: "forest_roots",
+            got: state.forest_roots.len(),
+            cap: MAX_UTREEXO_ROOTS,
+        });
+    }
+    let mut out = Vec::with_capacity(2 + state.forest_roots.len() * 32 + 8);
+    out.extend_from_slice(&(state.forest_roots.len() as u16).to_le_bytes());
+    for r in &state.forest_roots {
+        out.extend_from_slice(r);
+    }
+    out.extend_from_slice(&state.num_leaves.to_le_bytes());
+    Ok(out)
+}
+
+/// Decode a [`UtreexoAccumulatorState`] from the wire form produced by
+/// [`encode_utreexo_accumulator_state`]. Rejects counts over the cap
+/// but does NOT check the popcount invariant — that's
+/// [`UtreexoAccumulatorState::validate`]'s job.
+pub fn decode_utreexo_accumulator_state(
+    buf: &[u8],
+) -> Result<UtreexoAccumulatorState, JdCodecError> {
+    let mut cur = Cursor::new(buf);
+    let roots_len = cur.read_u16()? as usize;
+    if roots_len > MAX_UTREEXO_ROOTS {
+        return Err(JdCodecError::TooLarge {
+            field: "forest_roots",
+            got: roots_len,
+            cap: MAX_UTREEXO_ROOTS,
+        });
+    }
+    let mut forest_roots = Vec::with_capacity(roots_len);
+    for _ in 0..roots_len {
+        forest_roots.push(cur.read_array32()?);
+    }
+    let num_leaves = cur.read_u64()?;
+    if cur.remaining() > 0 {
+        return Err(JdCodecError::Trailing {
+            extra: cur.remaining(),
+        });
+    }
+    Ok(UtreexoAccumulatorState {
+        forest_roots,
+        num_leaves,
+    })
+}
+
 struct Cursor<'a> {
     buf: &'a [u8],
     pos: usize,
@@ -252,7 +316,53 @@ impl<'a> Cursor<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utreexo::UtreexoAccumulatorState;
     use proptest::prelude::*;
+
+    fn sample_state() -> UtreexoAccumulatorState {
+        UtreexoAccumulatorState {
+            forest_roots: vec![[0x11; 32], [0x22; 32], [0x33; 32]],
+            num_leaves: 0b111, // popcount=3, matches the 3 roots
+        }
+    }
+
+    #[test]
+    fn utreexo_state_roundtrip() {
+        let s = sample_state();
+        let bytes = encode_utreexo_accumulator_state(&s).unwrap();
+        // 2 + 3*32 + 8 = 106
+        assert_eq!(bytes.len(), 106);
+        let back = decode_utreexo_accumulator_state(&bytes).unwrap();
+        assert_eq!(s, back);
+    }
+
+    #[test]
+    fn utreexo_state_empty_roundtrip() {
+        let s = UtreexoAccumulatorState::empty();
+        let bytes = encode_utreexo_accumulator_state(&s).unwrap();
+        assert_eq!(bytes.len(), 2 + 8);
+        let back = decode_utreexo_accumulator_state(&bytes).unwrap();
+        assert_eq!(s, back);
+    }
+
+    #[test]
+    fn utreexo_state_rejects_overflow() {
+        let s = UtreexoAccumulatorState {
+            forest_roots: vec![[0u8; 32]; MAX_UTREEXO_ROOTS + 1],
+            num_leaves: 0,
+        };
+        let err = encode_utreexo_accumulator_state(&s).unwrap_err();
+        assert!(matches!(err, JdCodecError::TooLarge { .. }));
+    }
+
+    #[test]
+    fn utreexo_state_rejects_trailing() {
+        let s = sample_state();
+        let mut bytes = encode_utreexo_accumulator_state(&s).unwrap();
+        bytes.push(0xFF);
+        let err = decode_utreexo_accumulator_state(&bytes).unwrap_err();
+        assert!(matches!(err, JdCodecError::Trailing { .. }));
+    }
 
     fn sample() -> NewTemplateDineroJD {
         NewTemplateDineroJD {
