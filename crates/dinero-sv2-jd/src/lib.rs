@@ -41,4 +41,7 @@ pub use codec::{
 pub use coinbase::{assemble_stripped_coinbase, CoinbaseOutput, CoinbaseOutputs};
 pub use merkle::{compute_root, MerkleError, MerklePath};
 pub use messages::NewTemplateDineroJD;
-pub use utreexo::{commitment_placeholder, UtreexoAccumulatorState, UtreexoError};
+pub use utreexo::{
+    commitment, leaf_hash, node_hash, UtreexoAccumulatorState, UtreexoError, LEAF_DOMAIN_TAG,
+    NODE_DOMAIN_TAG,
+};

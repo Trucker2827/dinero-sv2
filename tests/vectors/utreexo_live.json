@@ -1,0 +1,15 @@
+{
+  "source": "live regtest via dinero-cli getutreexoroots + getutreexocommitment",
+  "num_leaves": 15939,
+  "forest_roots_hex": [
+    "6ae5efa9adfd812cecc72f7c837bc0bb69d1fbe5b266b18106189aec45b78efc",
+    "6afe3b3f3b3bc35ce500a41c0d57a6278f21fea45aa977632f62a8a8a5f0fbcc",
+    "669d8e491ddad3394ed1aaa59585896534c736ee56528a040759b1bcdaf9759e",
+    "4c114937d8fbdb494e4276434f30769bbd2ae1b14c7848ccaead6d45c5f7f9ca",
+    "8327ae19ceb62f7abf3389cf6960a35d61164b11ea8fe0ef72cc03c393e57b76",
+    "62cee458984d6b31b478095a57f32de61c0982beb2a21c58a7df8f96095c8805",
+    "5dee4fafac4c04ac08395e9cc83c6f4853ac6b460f5da2675ea4928cd9cb671f",
+    "c2742beec976b89d4e8bbb5d7e8ae87677d2736d35c8dea11807c603eb31ee2d"
+  ],
+  "expected_commitment_hex": "cb8592403b46beee369754ed54f642ffab310ae0df4d85661e681d339ea12ce4"
+}

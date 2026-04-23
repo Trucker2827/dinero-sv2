@@ -11,6 +11,7 @@ description = "Dinero Stratum V2 Job Declaration — miner-customizable template
 [dependencies]
 dinero-sv2-common = { workspace = true }
 thiserror = { workspace = true }
+sha2      = { workspace = true }
 
 [dev-dependencies]
 dinero-sv2-codec = { workspace = true }
