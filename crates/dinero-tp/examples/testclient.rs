@@ -22,8 +22,9 @@ use dinero_sv2_codec::{
     encode_submit_shares, encode_submit_shares_extended,
 };
 use dinero_sv2_common::{
-    CoinbaseOutputWire, OpenStandardMiningChannel, SetupConnection, SubmitSharesDinero,
-    SubmitSharesExtendedDinero, PROTOCOL_MINING, PROTOCOL_VERSION,
+    CoinbaseOutputWire, HeaderAssembly, NewTemplateDinero, OpenStandardMiningChannel,
+    SetupConnection, SubmitSharesDinero, SubmitSharesExtendedDinero, PROTOCOL_MINING,
+    PROTOCOL_VERSION,
 };
 use dinero_sv2_jd::{
     assemble_stripped_coinbase, commitment as utreexo_commitment, compute_root,
@@ -64,6 +65,23 @@ struct Args {
     /// verification.
     #[arg(long)]
     payout_script_hex: Option<String>,
+
+    /// Brute-force nonces for up to this many seconds looking for a
+    /// share that meets the channel's target. If 0 (default), just
+    /// submits a single share with `nonce=0xDEADBEEF`. Real miners set
+    /// this to a positive value — against permissive regtest targets
+    /// it will find blocks; against real mainnet difficulty it will
+    /// mostly submit non-block-winning shares for pool credit.
+    #[arg(long, default_value_t = 0)]
+    mine: u64,
+
+    /// Share target (pool-assigned) override for `--mine`. If the
+    /// testclient is talking to a pool whose share target it hasn't
+    /// learned explicitly, provide it as 64-hex-char big-endian u256.
+    /// Defaults to the channel target the pool sent in
+    /// OpenStandardMiningChannel.Success.
+    #[arg(long)]
+    share_target_hex: Option<String>,
 }
 
 #[tokio::main]
@@ -139,7 +157,7 @@ async fn main() -> Result<()> {
         .read_frame()
         .await?
         .ok_or_else(|| anyhow::anyhow!("EOF after OpenStandardMiningChannel"))?;
-    let channel_id = match f.msg_type {
+    let (channel_id, channel_target) = match f.msg_type {
         MSG_OPEN_STANDARD_MINING_CHANNEL_SUCCESS => {
             let succ = decode_open_standard_mining_channel_success(&f.payload)?;
             println!(
@@ -147,7 +165,7 @@ async fn main() -> Result<()> {
                 succ.channel_id,
                 hex::encode(succ.target)
             );
-            succ.channel_id
+            (succ.channel_id, succ.target)
         }
         MSG_OPEN_STANDARD_MINING_CHANNEL_ERROR => {
             bail!(
@@ -156,6 +174,21 @@ async fn main() -> Result<()> {
             );
         }
         other => bail!("unexpected response to OpenStandardMiningChannel: 0x{other:02x}"),
+    };
+
+    // Resolve the effective share target: --share-target-hex if set,
+    // otherwise the channel target the pool assigned.
+    let share_target: [u8; 32] = match &args.share_target_hex {
+        Some(h) => {
+            let bytes = hex::decode(h)?;
+            if bytes.len() != 32 {
+                bail!("share-target-hex must be 64 chars");
+            }
+            let mut a = [0u8; 32];
+            a.copy_from_slice(&bytes);
+            a
+        }
+        None => channel_target,
     };
 
     // ---- SetNewPrevHash ----
@@ -257,14 +290,17 @@ async fn main() -> Result<()> {
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("JD mode requires CoinbaseContext"))?,
             args.payout_script_hex.as_deref(),
+            share_target,
+            args.mine,
         )
         .await?;
     } else {
+        let nonce = pick_nonce(&tmpl, &tmpl, share_target, args.mine);
         let share = SubmitSharesDinero {
             channel_id,
             sequence_number: 1,
             job_id: u32::try_from(tmpl.template_id).unwrap_or(0),
-            nonce: 0xDEAD_BEEF,
+            nonce,
             timestamp: tmpl.timestamp,
             version: tmpl.version,
         };
@@ -307,6 +343,7 @@ async fn main() -> Result<()> {
 /// local payout script, assembles the coinbase locally, computes the
 /// post-coinbase Utreexo state + header `utreexo_root`, and submits
 /// an extended share carrying those outputs.
+#[allow(clippy::too_many_arguments)]
 async fn submit_extended_share(
     session: &mut NoiseSession<tokio::net::TcpStream>,
     tmpl: &dinero_sv2_common::NewTemplateDinero,
@@ -314,6 +351,8 @@ async fn submit_extended_share(
     pre_block_state: &UtreexoAccumulatorState,
     ctx: &dinero_sv2_common::CoinbaseContext,
     payout_script_hex: Option<&str>,
+    share_target: [u8; 32],
+    mine_budget_secs: u64,
 ) -> Result<()> {
     let payout_script = match payout_script_hex {
         Some(h) => hex::decode(h)?,
@@ -354,11 +393,27 @@ async fn submit_extended_share(
         hex::encode(tmpl.utreexo_root),
     );
 
+    // Build a template shape whose header fields match OUR computed
+    // roots, then either pick 0xDEADBEEF or brute-force a nonce that
+    // meets the share target.
+    let our_template = NewTemplateDinero {
+        template_id: tmpl.template_id,
+        future_template: tmpl.future_template,
+        version: tmpl.version,
+        prev_block_hash: tmpl.prev_block_hash,
+        merkle_root,
+        utreexo_root: our_utreexo_root,
+        timestamp: tmpl.timestamp,
+        difficulty: tmpl.difficulty,
+        coinbase_outputs_commitment: [0u8; 32],
+    };
+    let nonce = pick_nonce(&our_template, tmpl, share_target, mine_budget_secs);
+
     let ext = SubmitSharesExtendedDinero {
         channel_id,
         sequence_number: 1,
         job_id: u32::try_from(tmpl.template_id).unwrap_or(0),
-        nonce: 0xDEAD_BEEF,
+        nonce,
         timestamp: tmpl.timestamp,
         version: tmpl.version,
         coinbase_outputs: vec![CoinbaseOutputWire {
@@ -371,4 +426,50 @@ async fn submit_extended_share(
         .write_frame(MSG_SUBMIT_SHARES_EXTENDED, &buf)
         .await?;
     Ok(())
+}
+
+/// Either 0xDEADBEEF (when `budget_secs == 0`) or the first nonce
+/// whose header hash < `share_target`, up to the time budget.
+///
+/// `tmpl_for_header` supplies every field *except* nonce/ntime/version
+/// to `HeaderAssembly`; for JD mode it's the locally-computed template
+/// (with our utreexo_root + merkle_root), for standard mode it's the
+/// pool's NewMiningJob.
+fn pick_nonce(
+    tmpl_for_header: &NewTemplateDinero,
+    tmpl_for_version: &NewTemplateDinero,
+    share_target: [u8; 32],
+    budget_secs: u64,
+) -> u32 {
+    if budget_secs == 0 {
+        return 0xDEAD_BEEF;
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(budget_secs);
+    let mut tries = 0u64;
+    for nonce in 0u32..=u32::MAX {
+        if tries & 0xFFFFF == 0 && std::time::Instant::now() > deadline {
+            eprintln!(
+                "mining budget ({budget_secs}s) exhausted after {tries} tries; submitting last nonce"
+            );
+            return nonce.wrapping_sub(1);
+        }
+        tries += 1;
+        let share = SubmitSharesDinero {
+            channel_id: 0,
+            sequence_number: 0,
+            job_id: 0,
+            nonce,
+            timestamp: tmpl_for_version.timestamp,
+            version: tmpl_for_version.version,
+        };
+        let hash = HeaderAssembly::hash(tmpl_for_header, &share);
+        if hash < share_target {
+            eprintln!(
+                "mine: found share after {tries} tries, nonce={nonce} hash={}",
+                hex::encode(hash)
+            );
+            return nonce;
+        }
+    }
+    0xDEAD_BEEF
 }

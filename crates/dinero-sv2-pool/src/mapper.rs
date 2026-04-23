@@ -360,17 +360,19 @@ mod tests {
         // Minimal: stripped coinbase (no segwit), version=1, 1 input,
         // 1 output, locktime=0. prefix = version + 1 input; suffix = locktime.
         let hex_data = concat!(
-            "01000000",                 // version
-            "01",                       // in_count
+            "01000000", // version
+            "01",       // in_count
             "0000000000000000000000000000000000000000000000000000000000000000",
-            "ffffffff",                 // prevout idx
-            "03", "023c14",             // scriptSig
-            "ffffffff",                 // sequence
-            "01",                       // out_count
-            "00e40b5402000000",         // value
-            "22", "5120",
+            "ffffffff", // prevout idx
+            "03",
+            "023c14",           // scriptSig
+            "ffffffff",         // sequence
+            "01",               // out_count
+            "00e40b5402000000", // value
+            "22",
+            "5120",
             "d09a7dccc98a44fb62121ee035cac4dcf69908a8b0c20be5aff2233adda99d42",
-            "00000000"                  // locktime
+            "00000000" // locktime
         );
         let (prefix, suffix, witness) = split_coinbase_segwit(hex_data).unwrap();
         assert_eq!(witness.len(), 0);
