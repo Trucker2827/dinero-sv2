@@ -21,19 +21,21 @@ use clap::Parser;
 use dinero_sv2_codec::{
     decode_open_standard_mining_channel, decode_setup_connection, decode_submit_shares,
     encode_new_template, encode_open_standard_mining_channel_error,
-    encode_open_standard_mining_channel_success, encode_setup_connection_error,
-    encode_setup_connection_success, encode_submit_shares_error, encode_submit_shares_success,
+    encode_open_standard_mining_channel_success, encode_set_new_prev_hash,
+    encode_setup_connection_error, encode_setup_connection_success, encode_submit_shares_error,
+    encode_submit_shares_success,
 };
 use dinero_sv2_common::{
     HeaderAssembly, NewTemplateDinero, OpenStandardMiningChannelError,
-    OpenStandardMiningChannelSuccess, SetupConnectionError, SetupConnectionSuccess,
+    OpenStandardMiningChannelSuccess, SetNewPrevHash, SetupConnectionError, SetupConnectionSuccess,
     SubmitSharesError, SubmitSharesSuccess, PROTOCOL_MINING, PROTOCOL_VERSION,
 };
 use dinero_sv2_transport::{
     Frame, NoiseSession, StaticKeys, MSG_NEW_MINING_JOB, MSG_OPEN_STANDARD_MINING_CHANNEL,
     MSG_OPEN_STANDARD_MINING_CHANNEL_ERROR, MSG_OPEN_STANDARD_MINING_CHANNEL_SUCCESS,
     MSG_SETUP_CONNECTION, MSG_SETUP_CONNECTION_ERROR, MSG_SETUP_CONNECTION_SUCCESS,
-    MSG_SUBMIT_SHARES_ERROR, MSG_SUBMIT_SHARES_STANDARD, MSG_SUBMIT_SHARES_SUCCESS,
+    MSG_SET_NEW_PREV_HASH, MSG_SUBMIT_SHARES_ERROR, MSG_SUBMIT_SHARES_STANDARD,
+    MSG_SUBMIT_SHARES_SUCCESS,
 };
 use std::path::PathBuf;
 use tokio::net::TcpStream;
@@ -321,9 +323,7 @@ async fn serve_miner(
 
     let initial = rx.borrow_and_update().clone();
     if let Some(t) = initial {
-        let payload = encode_new_template(&t);
-        session.write_frame(MSG_NEW_MINING_JOB, &payload).await?;
-        debug!(template_id = t.template_id, "pushed initial mining job");
+        push_job(&mut session, channel_id, &t).await?;
         current = Some(t);
     }
 
@@ -337,9 +337,7 @@ async fn serve_miner(
                 }
                 let maybe_t = rx.borrow_and_update().clone();
                 if let Some(t) = maybe_t {
-                    let payload = encode_new_template(&t);
-                    session.write_frame(MSG_NEW_MINING_JOB, &payload).await?;
-                    debug!(template_id = t.template_id, "pushed mining job");
+                    push_job(&mut session, channel_id, &t).await?;
                     current = Some(t);
                 }
             }
@@ -409,6 +407,28 @@ async fn serve_miner(
             }
         }
     }
+}
+
+/// Emit `SetNewPrevHash` then `NewMiningJob` for this template.
+async fn push_job(
+    session: &mut NoiseSession<TcpStream>,
+    channel_id: u32,
+    t: &NewTemplateDinero,
+) -> Result<()> {
+    let snph = SetNewPrevHash {
+        channel_id,
+        prev_hash: t.prev_block_hash,
+        min_ntime: t.timestamp,
+        nbits: t.difficulty,
+    };
+    session
+        .write_frame(MSG_SET_NEW_PREV_HASH, &encode_set_new_prev_hash(&snph))
+        .await?;
+    session
+        .write_frame(MSG_NEW_MINING_JOB, &encode_new_template(t))
+        .await?;
+    debug!(template_id = t.template_id, "pushed SNPH + job");
+    Ok(())
 }
 
 fn leading_zero_target(bits: u8) -> [u8; 32] {

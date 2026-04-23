@@ -9,8 +9,8 @@
 
 use dinero_sv2_common::{
     OpenStandardMiningChannel, OpenStandardMiningChannelError, OpenStandardMiningChannelSuccess,
-    SetupConnection, SetupConnectionError, SetupConnectionSuccess, SubmitSharesError,
-    SubmitSharesSuccess,
+    SetNewPrevHash, SetupConnection, SetupConnectionError, SetupConnectionSuccess,
+    SubmitSharesError, SubmitSharesSuccess,
 };
 
 /// Hard cap on a STR0_255 length byte.
@@ -189,6 +189,34 @@ pub fn decode_open_standard_mining_channel_error(
     Ok(OpenStandardMiningChannelError {
         request_id,
         error_code,
+    })
+}
+
+// ------------------------------ SetNewPrevHash ------------------------------
+
+/// Encode a [`SetNewPrevHash`] message.
+pub fn encode_set_new_prev_hash(msg: &SetNewPrevHash) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + 32 + 8 + 4);
+    out.extend_from_slice(&msg.channel_id.to_le_bytes());
+    out.extend_from_slice(&msg.prev_hash);
+    out.extend_from_slice(&msg.min_ntime.to_le_bytes());
+    out.extend_from_slice(&msg.nbits.to_le_bytes());
+    out
+}
+
+/// Decode a [`SetNewPrevHash`] message.
+pub fn decode_set_new_prev_hash(buf: &[u8]) -> Result<SetNewPrevHash, Sv2CodecError> {
+    let mut cur = Cursor::new(buf);
+    let channel_id = cur.read_u32()?;
+    let prev_hash = cur.read_array32()?;
+    let min_ntime = cur.read_u64()?;
+    let nbits = cur.read_u32()?;
+    cur.finish()?;
+    Ok(SetNewPrevHash {
+        channel_id,
+        prev_hash,
+        min_ntime,
+        nbits,
     })
 }
 
@@ -424,6 +452,33 @@ mod tests {
             m,
             decode_open_standard_mining_channel_error(&bytes).unwrap()
         );
+    }
+
+    #[test]
+    fn set_new_prev_hash_roundtrip() {
+        let m = SetNewPrevHash {
+            channel_id: 1,
+            prev_hash: [0xAB; 32],
+            min_ntime: 1_776_384_000,
+            nbits: 0x1d_31_ff_ce,
+        };
+        let bytes = encode_set_new_prev_hash(&m);
+        assert_eq!(bytes.len(), 4 + 32 + 8 + 4);
+        assert_eq!(m, decode_set_new_prev_hash(&bytes).unwrap());
+    }
+
+    #[test]
+    fn set_new_prev_hash_rejects_trailing() {
+        let m = SetNewPrevHash {
+            channel_id: 1,
+            prev_hash: [0; 32],
+            min_ntime: 0,
+            nbits: 0,
+        };
+        let mut bytes = encode_set_new_prev_hash(&m);
+        bytes.push(0xFF);
+        let err = decode_set_new_prev_hash(&bytes).unwrap_err();
+        assert!(matches!(err, Sv2CodecError::Trailing { .. }));
     }
 
     #[test]

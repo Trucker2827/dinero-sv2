@@ -16,7 +16,7 @@
 use anyhow::{bail, Result};
 use clap::Parser;
 use dinero_sv2_codec::{
-    decode_new_template, decode_open_standard_mining_channel_success,
+    decode_new_template, decode_open_standard_mining_channel_success, decode_set_new_prev_hash,
     decode_setup_connection_success, decode_submit_shares_error, decode_submit_shares_success,
     encode_open_standard_mining_channel, encode_setup_connection, encode_submit_shares,
 };
@@ -28,7 +28,8 @@ use dinero_sv2_transport::{
     Frame, NoiseSession, MSG_NEW_MINING_JOB, MSG_OPEN_STANDARD_MINING_CHANNEL,
     MSG_OPEN_STANDARD_MINING_CHANNEL_ERROR, MSG_OPEN_STANDARD_MINING_CHANNEL_SUCCESS,
     MSG_SETUP_CONNECTION, MSG_SETUP_CONNECTION_ERROR, MSG_SETUP_CONNECTION_SUCCESS,
-    MSG_SUBMIT_SHARES_ERROR, MSG_SUBMIT_SHARES_STANDARD, MSG_SUBMIT_SHARES_SUCCESS,
+    MSG_SET_NEW_PREV_HASH, MSG_SUBMIT_SHARES_ERROR, MSG_SUBMIT_SHARES_STANDARD,
+    MSG_SUBMIT_SHARES_SUCCESS,
 };
 use std::net::SocketAddr;
 use tokio::net::TcpStream;
@@ -135,6 +136,27 @@ async fn main() -> Result<()> {
         }
         other => bail!("unexpected response to OpenStandardMiningChannel: 0x{other:02x}"),
     };
+
+    // ---- SetNewPrevHash ----
+    let f = session
+        .read_frame()
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("no SetNewPrevHash"))?;
+    if f.msg_type != MSG_SET_NEW_PREV_HASH {
+        bail!(
+            "expected MSG_SET_NEW_PREV_HASH (0x{:02x}), got 0x{:02x}",
+            MSG_SET_NEW_PREV_HASH,
+            f.msg_type
+        );
+    }
+    let snph = decode_set_new_prev_hash(&f.payload)?;
+    println!(
+        "SetNewPrevHash: channel_id={} prev_hash={} min_ntime={} nbits=0x{:08x}",
+        snph.channel_id,
+        hex::encode(snph.prev_hash),
+        snph.min_ntime,
+        snph.nbits,
+    );
 
     // ---- NewMiningJob ----
     let Frame {

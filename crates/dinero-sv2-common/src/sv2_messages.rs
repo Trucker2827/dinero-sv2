@@ -135,3 +135,25 @@ pub struct SubmitSharesError {
     /// `b"under-target"`.
     pub error_code: Vec<u8>,
 }
+
+/// Pool → miner: tip changed.
+///
+/// Sent *before* the next `NewMiningJob`. Miners MUST treat any
+/// in-flight share computation for the previous tip as invalidated —
+/// further submits against it will be rejected as stale.
+///
+/// Dinero deviates from SV2's `SetNewPrevHash` in one field: `min_ntime`
+/// is `u64` to match the Dinero header's 64-bit timestamp.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetNewPrevHash {
+    /// Channel this applies to (must match the channel_id the miner
+    /// opened).
+    pub channel_id: u32,
+    /// New tip hash (header offset 0x04, raw bytes, not display-order).
+    pub prev_hash: [u8; 32],
+    /// Minimum block timestamp the miner may use for jobs on this
+    /// `prev_hash`. `u64` per Dinero's 8-byte `timestamp` field.
+    pub min_ntime: u64,
+    /// Compact difficulty target for jobs on this `prev_hash`.
+    pub nbits: u32,
+}

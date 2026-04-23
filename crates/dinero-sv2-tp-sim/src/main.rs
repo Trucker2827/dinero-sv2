@@ -23,20 +23,21 @@ use clap::Parser;
 use dinero_sv2_codec::{
     decode_open_standard_mining_channel, decode_setup_connection, decode_submit_shares,
     encode_new_template, encode_open_standard_mining_channel_error,
-    encode_open_standard_mining_channel_success, encode_setup_connection_error,
-    encode_setup_connection_success, encode_submit_shares_error, encode_submit_shares_success,
-    NEW_TEMPLATE_DINERO_SIZE, SUBMIT_SHARES_DINERO_SIZE,
+    encode_open_standard_mining_channel_success, encode_set_new_prev_hash,
+    encode_setup_connection_error, encode_setup_connection_success, encode_submit_shares_error,
+    encode_submit_shares_success, NEW_TEMPLATE_DINERO_SIZE, SUBMIT_SHARES_DINERO_SIZE,
 };
 use dinero_sv2_common::{
     HeaderAssembly, NewTemplateDinero, OpenStandardMiningChannelError,
-    OpenStandardMiningChannelSuccess, SetupConnectionError, SetupConnectionSuccess,
+    OpenStandardMiningChannelSuccess, SetNewPrevHash, SetupConnectionError, SetupConnectionSuccess,
     SubmitSharesError, SubmitSharesSuccess, PROTOCOL_MINING, PROTOCOL_VERSION,
 };
 use dinero_sv2_transport::{
     Frame, NoiseSession, StaticKeys, MSG_NEW_MINING_JOB, MSG_OPEN_STANDARD_MINING_CHANNEL,
     MSG_OPEN_STANDARD_MINING_CHANNEL_ERROR, MSG_OPEN_STANDARD_MINING_CHANNEL_SUCCESS,
     MSG_SETUP_CONNECTION, MSG_SETUP_CONNECTION_ERROR, MSG_SETUP_CONNECTION_SUCCESS,
-    MSG_SUBMIT_SHARES_ERROR, MSG_SUBMIT_SHARES_STANDARD, MSG_SUBMIT_SHARES_SUCCESS,
+    MSG_SET_NEW_PREV_HASH, MSG_SUBMIT_SHARES_ERROR, MSG_SUBMIT_SHARES_STANDARD,
+    MSG_SUBMIT_SHARES_SUCCESS,
 };
 use std::path::PathBuf;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -279,7 +280,7 @@ async fn serve_client<S: AsyncRead + AsyncWrite + Unpin>(
 
     let initial = rx.borrow_and_update().clone();
     if let Some(t) = initial {
-        send_template(&mut session, &t).await?;
+        push_job(&mut session, channel_id, &t).await?;
         current = Some(t);
     }
 
@@ -293,7 +294,7 @@ async fn serve_client<S: AsyncRead + AsyncWrite + Unpin>(
                 }
                 let maybe_t = rx.borrow_and_update().clone();
                 if let Some(t) = maybe_t {
-                    send_template(&mut session, &t).await?;
+                    push_job(&mut session, channel_id, &t).await?;
                     current = Some(t);
                 }
             }
@@ -323,13 +324,23 @@ async fn serve_client<S: AsyncRead + AsyncWrite + Unpin>(
     }
 }
 
-async fn send_template<S: AsyncRead + AsyncWrite + Unpin>(
+async fn push_job<S: AsyncRead + AsyncWrite + Unpin>(
     session: &mut NoiseSession<S>,
+    channel_id: u32,
     tmpl: &NewTemplateDinero,
 ) -> Result<()> {
+    let snph = SetNewPrevHash {
+        channel_id,
+        prev_hash: tmpl.prev_block_hash,
+        min_ntime: tmpl.timestamp,
+        nbits: tmpl.difficulty,
+    };
+    session
+        .write_frame(MSG_SET_NEW_PREV_HASH, &encode_set_new_prev_hash(&snph))
+        .await?;
     let payload = encode_new_template(tmpl);
     session.write_frame(MSG_NEW_MINING_JOB, &payload).await?;
-    debug!(id = tmpl.template_id, "sent mining job");
+    debug!(id = tmpl.template_id, "sent SNPH + mining job");
     Ok(())
 }
 
@@ -541,7 +552,10 @@ mod tests {
             .unwrap();
         let channel_id = handshake_as_initiator(&mut client).await;
 
-        // Receive the mining job frame.
+        // First we get SetNewPrevHash, then NewMiningJob.
+        let snph = client.read_frame().await.unwrap().unwrap();
+        assert_eq!(snph.msg_type, MSG_SET_NEW_PREV_HASH);
+
         let Frame {
             msg_type: mtype,
             payload,
@@ -583,7 +597,8 @@ mod tests {
             .await
             .unwrap();
         let _channel_id = handshake_as_initiator(&mut client).await;
-        // Drain the initial mining-job frame.
+        // Drain the initial SetNewPrevHash + NewMiningJob pair.
+        let _ = client.read_frame().await.unwrap().unwrap();
         let _ = client.read_frame().await.unwrap().unwrap();
 
         // Send a truncated share payload.

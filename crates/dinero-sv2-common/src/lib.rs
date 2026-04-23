@@ -17,8 +17,8 @@ pub mod sv2_messages;
 
 pub use sv2_messages::{
     OpenStandardMiningChannel, OpenStandardMiningChannelError, OpenStandardMiningChannelSuccess,
-    SetupConnection, SetupConnectionError, SetupConnectionSuccess, SubmitSharesError,
-    SubmitSharesSuccess, PROTOCOL_MINING, PROTOCOL_VERSION,
+    SetNewPrevHash, SetupConnection, SetupConnectionError, SetupConnectionSuccess,
+    SubmitSharesError, SubmitSharesSuccess, PROTOCOL_MINING, PROTOCOL_VERSION,
 };
 
 use sha2::{Digest, Sha256};
