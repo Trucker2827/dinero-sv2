@@ -323,43 +323,41 @@ async fn submitblock_rejects_tampered_utreexo_root() -> Result<()> {
 /// Companion test — tampered `utreexo_root` submitted as a
 /// **side-chain** block (parent != current tip).
 ///
-/// The upstream `submitblock` fix in Dinero `a3c9fd839` gates the
-/// new utreexo check on `isMainChainExtension`. Side-chain blocks
-/// deliberately skip it, because their utreexo root is computed
-/// against a different fork's UTXO state and comparing it to the
-/// live main-chain forest produces false positives. A fork-aware
-/// check would need to walk back to the fork point and replay the
-/// alternate chain — substantial infrastructure not yet in place.
+/// Background. The first accept-time fix in Dinero `a3c9fd839`
+/// gated the utreexo check on `isMainChainExtension`, so
+/// side-chain blocks skipped it. That was a disk/DoS vector
+/// (tampered blocks stored on disk even though ConnectTip's
+/// reorg-time backstop refused to activate them).
 ///
-/// Empirically (2026-04-23) this means:
-///   - Accept-time: a tampered side-chain block is stored on disk.
-///     The acceptance-time utreexo check never fires.
-///   - Reorg-time: if a reorg tries to activate the tampered block,
-///     `ConnectTip → block_validator_->ConnectBlock →
-///     ValidateAndApplyBlock → ConnectBlockInternal(verify_root=true)`
-///     at `block_validation.cpp:1668-1705` catches the mismatch and
-///     refuses to activate it. The daemon falls back to an earlier
-///     ancestor rather than accepting a bad tip.
+/// The follow-up fix adds `ComputeUtreexoRootPureFromForest` to
+/// `BlockValidator` and uses it in `AcceptBlockFromRPC` for the
+/// common case: side-chain blocks that are coinbase-only and
+/// whose parent is in the main chain at a known height. The
+/// daemon loads the saved utreexo checkpoint at the parent's
+/// height (`chain_db->getUtreexoCheckpoint`), re-applies the
+/// block's coinbase outputs, and compares to the header root.
 ///
-/// So chain integrity is preserved — no tampered block can become
-/// the main tip — but the accept-time gap means a malicious peer
-/// can fill side-chain storage with bad blocks. That's a
-/// disk/DoS concern, not a consensus escape.
+/// Still deferred to the reorg-time backstop:
+///   - Multi-tx side-chain blocks (would need a fork-aware UTXO
+///     lookup — the live `consensus_utxo_set_` may have spent
+///     or never had outputs the side chain is spending).
+///   - Side-chain blocks whose parent is itself on a fork
+///     (no checkpoint available cheaply).
 ///
-/// This test is KNOWN FAILING to lock the gap in place: when a
-/// proper fork-aware accept-time check lands, the test flips green.
+/// What this test asserts: a coinbase-only side-chain block
+/// with a tampered `utreexo_root` is rejected at accept time,
+/// not silently stored.
 ///
 /// Flow:
 ///   1. Before seeding, capture a template built on genesis.
-///   2. Seed one block so the captured template's parent becomes
-///      a non-tip ancestor (side-chain).
+///   2. Seed one block so the captured template's parent
+///      becomes a non-tip ancestor (side-chain relative to the
+///      new main tip).
 ///   3. Build the side-chain block from the captured template
 ///      with a tampered `utreexo_root`.
-///   4. Submit. If accepted, invalidate the main tip to force a
-///      reorg attempt and confirm ConnectTip's backstop refuses
-///      to activate the tampered block.
+///   4. Submit. Expect rejection with a utreexo-flavored error.
 #[tokio::test]
-#[ignore = "KNOWN FAILING: side-chain accept-time utreexo check not implemented — see module doc"]
+#[ignore = "spawns regtest dinerod; run with --ignored"]
 async fn side_chain_tampered_utreexo_root() -> Result<()> {
     let daemon = RegtestDaemon::spawn().context("spawn regtest dinerod")?;
     daemon.wait_for_cookie().context("wait for cookie")?;
