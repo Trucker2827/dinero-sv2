@@ -8,6 +8,7 @@ members = [
     "crates/dinero-sv2-tp-sim",
     "crates/dinero-tp",
     "crates/dinero-sv2-pool",
+    "crates/dinero-sv2-miner",
 ]
 
 [workspace.package]

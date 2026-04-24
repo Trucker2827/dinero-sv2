@@ -27,7 +27,7 @@ pub mod keys;
 pub mod noise;
 
 pub use keys::StaticKeys;
-pub use noise::{Frame, NoiseSession, EXT_BASIC, NOISE_MAX_PAYLOAD};
+pub use noise::{Frame, NoiseReader, NoiseSession, NoiseWriter, EXT_BASIC, NOISE_MAX_PAYLOAD};
 
 // SV2-aligned message types. Numbers mirror the Stratum V2 spec's
 // Common / Mining extension codes where applicable.

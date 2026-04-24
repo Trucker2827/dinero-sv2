@@ -235,6 +235,33 @@ impl<S: AsyncRead + AsyncWrite + Unpin> NoiseSession<S> {
         self.peer_static
     }
 
+    /// Split an active session into independent read and write halves so a
+    /// `select!` loop can drive reads in one task and writes in another
+    /// without dropping a read-in-progress (which would desync the Noise
+    /// cipher).
+    ///
+    /// Both halves share the underlying `TransportState` behind a mutex;
+    /// the mutex is only acquired for the synchronous cipher operation
+    /// (microseconds), never across an await, so reads and writes
+    /// interleave freely.
+    pub fn split(self) -> (NoiseReader<tokio::io::ReadHalf<S>>, NoiseWriter<tokio::io::WriteHalf<S>>)
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        let (r, w) = tokio::io::split(self.stream);
+        let shared = std::sync::Arc::new(tokio::sync::Mutex::new(self.transport));
+        (
+            NoiseReader {
+                stream: r,
+                transport: std::sync::Arc::clone(&shared),
+            },
+            NoiseWriter {
+                stream: w,
+                transport: shared,
+            },
+        )
+    }
+
     /// Test-only: encrypt and send arbitrary plaintext bytes (bypassing
     /// the SV2 inner header). Used to craft malformed frames for the
     /// decoder's robustness tests.
@@ -247,6 +274,89 @@ impl<S: AsyncRead + AsyncWrite + Unpin> NoiseSession<S> {
             .context("transport write_message")?;
         write_u24_prefixed(&mut self.stream, &cipher[..n]).await
     }
+}
+
+/// Reader half of a split Noise session. `read_frame` is safe to drop in
+/// `tokio::select!` only at its first await point — callers that care
+/// about cancel-safety should instead run this in a dedicated task and
+/// forward frames via a channel.
+pub struct NoiseReader<R> {
+    stream: R,
+    transport: std::sync::Arc<tokio::sync::Mutex<TransportState>>,
+}
+
+impl<R: AsyncRead + Unpin> NoiseReader<R> {
+    /// Receive one encrypted SV2 frame. Returns `Ok(None)` on clean EOF.
+    pub async fn read_frame(&mut self) -> Result<Option<Frame>> {
+        let cipher = match read_u24_prefixed_opt(&mut self.stream).await? {
+            Some(c) => c,
+            None => return Ok(None),
+        };
+        let mut plain = vec![0u8; cipher.len()];
+        let n = {
+            let mut t = self.transport.lock().await;
+            t.read_message(&cipher, &mut plain)
+                .context("transport read_message")?
+        };
+        if n < SV2_HEADER_LEN {
+            bail!("inner plaintext shorter than SV2 header: {n} < {SV2_HEADER_LEN}");
+        }
+        let ext_type = u16::from_le_bytes([plain[0], plain[1]]);
+        let msg_type = plain[2];
+        let msg_length = u24_from_le(&plain[3..6]) as usize;
+        if SV2_HEADER_LEN + msg_length != n {
+            bail!(
+                "sv2 header msg_length {msg_length} disagrees with body length {}",
+                n - SV2_HEADER_LEN
+            );
+        }
+        let payload = plain[SV2_HEADER_LEN..SV2_HEADER_LEN + msg_length].to_vec();
+        Ok(Some(Frame {
+            ext_type,
+            msg_type,
+            payload,
+        }))
+    }
+}
+
+/// Writer half of a split Noise session. Encrypts and sends SV2 frames.
+pub struct NoiseWriter<W> {
+    stream: W,
+    transport: std::sync::Arc<tokio::sync::Mutex<TransportState>>,
+}
+
+impl<W: AsyncWrite + Unpin> NoiseWriter<W> {
+    /// Send an SV2 frame over Noise using the default extension type.
+    pub async fn write_frame(&mut self, msg_type: u8, payload: &[u8]) -> Result<()> {
+        self.write_frame_ext(EXT_BASIC, msg_type, payload).await
+    }
+
+    /// Send an SV2 frame over Noise with an explicit extension type.
+    pub async fn write_frame_ext(
+        &mut self,
+        ext_type: u16,
+        msg_type: u8,
+        payload: &[u8],
+    ) -> Result<()> {
+        if payload.len() > NOISE_MAX_PAYLOAD {
+            bail!("payload too large: {} > {NOISE_MAX_PAYLOAD}", payload.len());
+        }
+        let inner_len = SV2_HEADER_LEN + payload.len();
+        let mut plain = Vec::with_capacity(inner_len);
+        plain.extend_from_slice(&ext_type.to_le_bytes());
+        plain.push(msg_type);
+        plain.extend_from_slice(&u24_le(payload.len() as u32));
+        plain.extend_from_slice(payload);
+        let mut cipher = vec![0u8; inner_len + 16];
+        let n = {
+            let mut t = self.transport.lock().await;
+            t.write_message(&plain, &mut cipher)
+                .context("transport write_message")?
+        };
+        write_u24_prefixed(&mut self.stream, &cipher[..n]).await?;
+        Ok(())
+    }
+
 }
 
 // ---------------------------------------------------------------------
