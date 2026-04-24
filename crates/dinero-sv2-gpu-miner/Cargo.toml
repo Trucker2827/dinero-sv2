@@ -1,0 +1,32 @@
+[package]
+name        = "dinero-sv2-gpu-miner"
+version     = { workspace = true }
+edition     = { workspace = true }
+license     = { workspace = true }
+repository  = { workspace = true }
+authors     = { workspace = true }
+rust-version = { workspace = true }
+description = "Dinero Stratum V2 GPU miner — Metal backend for Apple Silicon, SV2 + Job Declaration"
+
+[[bin]]
+name = "dinero-sv2-gpu-miner"
+path = "src/main.rs"
+
+[dependencies]
+dinero-sv2-common    = { workspace = true }
+dinero-sv2-codec     = { workspace = true }
+dinero-sv2-transport = { workspace = true }
+dinero-sv2-jd        = { workspace = true }
+anyhow     = { workspace = true }
+hex        = { workspace = true }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+tokio      = { workspace = true }
+clap       = { workspace = true }
+tracing    = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+metal = "0.27"
+objc  = "0.2"
+core-graphics-types = "0.1"
