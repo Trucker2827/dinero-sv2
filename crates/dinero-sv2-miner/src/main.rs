@@ -535,11 +535,39 @@ fn start_hashing(
         }),
     );
 
-    // Snapshot state used by each rayon worker. Cloned into the closure.
-    let start_instant = Instant::now();
     let tmpl_timestamp = tmpl.timestamp;
     let tmpl_version = tmpl.version;
     let tmpl_id = tmpl.template_id;
+
+    // Shared hash counter + a telemetry thread that reports the rolling
+    // hashrate as a JSON event every 2 seconds. Sibling of the GPU
+    // miner's hashrate event so Qt can treat both backends uniformly.
+    let hashes_done = Arc::new(AtomicU64::new(0));
+    {
+        let hashes = Arc::clone(&hashes_done);
+        let cancel_telemetry = Arc::clone(&cancel);
+        std::thread::spawn(move || {
+            let mut last = 0u64;
+            let mut last_instant = Instant::now();
+            loop {
+                std::thread::sleep(Duration::from_secs(2));
+                if cancel_telemetry.load(Ordering::Relaxed) {
+                    return;
+                }
+                let now = hashes.load(Ordering::Relaxed);
+                let dt = last_instant.elapsed().as_secs_f64();
+                let delta = now.saturating_sub(last);
+                let mhs = (delta as f64 / dt) / 1e6;
+                // JSON event on stdout so the Qt frontend can parse it.
+                println!(
+                    "{{\"event\":\"hashrate\",\"mhs\":{:.2},\"hashes_since_last\":{},\"interval_s\":{:.2},\"backend\":\"cpu\"}}",
+                    mhs, delta, dt,
+                );
+                last = now;
+                last_instant = Instant::now();
+            }
+        });
+    }
 
     std::thread::spawn(move || {
         let per_thread = (u32::MAX as u64 + 1) / (threads.max(1) as u64);
@@ -558,14 +586,16 @@ fn start_hashing(
 
         ranges.par_iter().for_each(|(start, end)| {
             let mut tries: u64 = 0;
+            let mut local_hashes: u64 = 0;
             let mut nonce = *start;
             loop {
                 if cancel.load(Ordering::Relaxed) {
+                    hashes_done.fetch_add(local_hashes, Ordering::Relaxed);
                     return;
                 }
-                // Cheap timer check every 1M hashes.
                 if tries & 0xFFFFF == 0 && tries > 0 {
-                    // no-op, placeholder for future periodic reporting
+                    hashes_done.fetch_add(local_hashes, Ordering::Relaxed);
+                    local_hashes = 0;
                 }
 
                 let share = SubmitSharesDinero {
@@ -577,6 +607,7 @@ fn start_hashing(
                     version: tmpl_version,
                 };
                 let hash = HeaderAssembly::hash(&our_template, &share);
+                local_hashes += 1;
                 if hash < share_target {
                     let meets_block = hash < block_target;
                     let _ = share_tx.send(FoundShare {
@@ -590,17 +621,15 @@ fn start_hashing(
                         tries,
                         coinbase_outputs: coinbase_outputs_wire.clone(),
                     });
-                    // Keep searching for more shares; only stop if the
-                    // session invalidates the template.
                 }
                 tries += 1;
                 if nonce == *end {
+                    hashes_done.fetch_add(local_hashes, Ordering::Relaxed);
                     break;
                 }
                 nonce = nonce.wrapping_add(1);
             }
         });
-        let _ = start_instant; // suppress unused if future telemetry is added
     });
 }
 

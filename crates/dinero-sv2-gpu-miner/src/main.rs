@@ -559,11 +559,16 @@ fn start_hashing_gpu(
             total_hashes += this_batch as u64;
             batches_since_last_report += 1;
             if batches_since_last_report >= 64 {
-                eprintln!(
-                    "[metal] hashrate={:.1} MH/s dispatch_ms={:.2} nonce=0x{:08x}",
-                    (total_hashes as f64 / (total_ms / 1000.0)) / 1e6,
-                    total_ms / batches_since_last_report as f64,
-                    nonce_start,
+                let mhs = (total_hashes as f64 / (total_ms / 1000.0)) / 1e6;
+                let dispatch_ms = total_ms / batches_since_last_report as f64;
+                // JSON event on stdout so the Qt frontend can parse it
+                // and update the hashrate widget. Kept as a single line
+                // so the merged-channel reader doesn't split it.
+                println!(
+                    "{{\"event\":\"hashrate\",\"mhs\":{:.2},\"dispatch_ms\":{:.3},\"nonce_start\":\"0x{:08x}\",\"backend\":\"metal\"}}",
+                    mhs,
+                    dispatch_ms,
+                    nonce_start as u32,
                 );
                 batches_since_last_report = 0;
                 total_ms = 0.0;
