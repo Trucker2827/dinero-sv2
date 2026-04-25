@@ -555,92 +555,104 @@ fn start_hashing_gpu(
         }),
     );
 
-    // Pre-header bytes with nonce=0 (kernel writes each thread's nonce into
-    // offset 112 before hashing). Build a 128-byte buffer from the header
-    // assembly. HeaderAssembly::hash would also work, but we want the raw
-    // bytes for the kernel, not the final digest.
-    let header_bytes = assemble_header_bytes(&our_template, tmpl.timestamp, tmpl.version);
-
-    // Spawn Metal dispatch loop on its own thread; runs until cancel flag
-    // trips, nonce space exhausted, or a share/block target is hit.
-    let tmpl_timestamp = tmpl.timestamp;
+    let tmpl_initial_timestamp = tmpl.timestamp;
     let tmpl_version = tmpl.version;
     let tmpl_id = tmpl.template_id;
 
-    // Hashrate telemetry: emit once per second (~500 dispatches at full
-    // GPU speed) instead of once per 64 dispatches. UI panels don't need
-    // 8 Hz updates and the per-event cost on Qt's main thread was the
-    // dominant cause of the observed UI freeze + reverse throughput.
+    // Hash thread:
+    // - Inner loop: sweep the full u32 nonce space at the current timestamp.
+    // - Outer loop: when the nonce space exhausts, bump timestamp by 1 and
+    //   re-sweep. Each timestamp gives a fresh 4.3B-nonce search space.
+    //   At ~535 MH/s on M4 Max one sweep takes ~8 s, so we cycle through
+    //   timestamps at 1 Hz — well within any pool-side ntime tolerance.
+    //   Without this wrap, the thread would silently exit after 8 s of
+    //   work and the share counter freezes whenever new pool jobs lag.
     std::thread::spawn(move || {
         let gen_at_spawn = gen;
         let global_generation = Arc::clone(&generation);
         let stale = move || global_generation.load(Ordering::Relaxed) > gen_at_spawn;
 
-        let mut nonce_start: u64 = 0;
         let batch: u64 = batch_size as u64;
         let mut total_ms_since_emit: f64 = 0.0;
         let mut hashes_since_emit: u64 = 0;
         let mut last_emit = std::time::Instant::now();
         const EMIT_INTERVAL_MS: u128 = 1000;
-        while nonce_start <= u32::MAX as u64 {
+
+        let mut current_timestamp: u64 = tmpl_initial_timestamp;
+        'outer: loop {
             if stale() {
                 return;
             }
-            let this_batch = std::cmp::min(batch, (u32::MAX as u64 + 1).saturating_sub(nonce_start)) as u32;
-            let outcome = match gpu.dispatch(&header_bytes, &share_target, nonce_start as u32, this_batch) {
-                Ok(out) => out,
-                Err(err) => {
-                    tracing::error!("metal dispatch failed: {err}");
+            let header_bytes = assemble_header_bytes(&our_template, current_timestamp, tmpl_version);
+            let mut nonce_start: u64 = 0;
+            while nonce_start <= u32::MAX as u64 {
+                if stale() {
                     return;
                 }
-            };
-            total_ms_since_emit += outcome.elapsed_ms;
-            hashes_since_emit += this_batch as u64;
-            if last_emit.elapsed().as_millis() >= EMIT_INTERVAL_MS {
-                let mhs = (hashes_since_emit as f64 / (total_ms_since_emit / 1000.0)) / 1e6;
-                let dispatch_ms = total_ms_since_emit / ((hashes_since_emit as f64) / (batch_size as f64)).max(1.0);
-                // JSON event on stdout so the Qt frontend can parse it
-                // and update the hashrate widget. Kept as a single line
-                // so the merged-channel reader doesn't split it.
-                println!(
-                    "{{\"event\":\"hashrate\",\"mhs\":{:.2},\"dispatch_ms\":{:.3},\"nonce_start\":\"0x{:08x}\",\"backend\":\"metal\"}}",
-                    mhs,
-                    dispatch_ms,
-                    nonce_start as u32,
-                );
-                last_emit = std::time::Instant::now();
-                total_ms_since_emit = 0.0;
-                hashes_since_emit = 0;
-            }
-            if outcome.found {
-                let nonce = outcome.nonce;
-                let share = SubmitSharesDinero {
-                    channel_id: 0,
-                    sequence_number: 0,
-                    job_id: 0,
-                    nonce,
-                    timestamp: tmpl_timestamp,
-                    version: tmpl_version,
+                let this_batch = std::cmp::min(batch, (u32::MAX as u64 + 1).saturating_sub(nonce_start)) as u32;
+                let outcome = match gpu.dispatch(&header_bytes, &share_target, nonce_start as u32, this_batch) {
+                    Ok(out) => out,
+                    Err(err) => {
+                        tracing::error!("metal dispatch failed: {err}");
+                        return;
+                    }
                 };
-                let hash = HeaderAssembly::hash(&our_template, &share);
-                if hash < share_target {
-                    let meets_block = hash < block_target;
-                    let hashes = nonce_start + outcome.nonce.wrapping_sub(nonce_start as u32) as u64;
-                    let _ = share_tx.send(FoundShare {
-                        generation: gen,
-                        template_id: tmpl_id,
-                        timestamp: tmpl_timestamp,
-                        version: tmpl_version,
-                        nonce,
-                        hash,
-                        meets_block_target: meets_block,
-                        hashes,
-                        coinbase_outputs: coinbase_outputs_wire.clone(),
-                    });
-                    // Keep sweeping — more shares may land in higher ranges.
+                total_ms_since_emit += outcome.elapsed_ms;
+                hashes_since_emit += this_batch as u64;
+                if last_emit.elapsed().as_millis() >= EMIT_INTERVAL_MS {
+                    let mhs = (hashes_since_emit as f64 / (total_ms_since_emit / 1000.0)) / 1e6;
+                    let dispatch_ms = total_ms_since_emit / ((hashes_since_emit as f64) / (batch_size as f64)).max(1.0);
+                    println!(
+                        "{{\"event\":\"hashrate\",\"mhs\":{:.2},\"dispatch_ms\":{:.3},\"nonce_start\":\"0x{:08x}\",\"timestamp\":{},\"backend\":\"metal\"}}",
+                        mhs,
+                        dispatch_ms,
+                        nonce_start as u32,
+                        current_timestamp,
+                    );
+                    last_emit = std::time::Instant::now();
+                    total_ms_since_emit = 0.0;
+                    hashes_since_emit = 0;
                 }
+                if outcome.found {
+                    let nonce = outcome.nonce;
+                    let share = SubmitSharesDinero {
+                        channel_id: 0,
+                        sequence_number: 0,
+                        job_id: 0,
+                        nonce,
+                        timestamp: current_timestamp,
+                        version: tmpl_version,
+                    };
+                    let hash = HeaderAssembly::hash(&our_template, &share);
+                    if hash < share_target {
+                        let meets_block = hash < block_target;
+                        let hashes = nonce_start + outcome.nonce.wrapping_sub(nonce_start as u32) as u64;
+                        let _ = share_tx.send(FoundShare {
+                            generation: gen,
+                            template_id: tmpl_id,
+                            timestamp: current_timestamp,
+                            version: tmpl_version,
+                            nonce,
+                            hash,
+                            meets_block_target: meets_block,
+                            hashes,
+                            coinbase_outputs: coinbase_outputs_wire.clone(),
+                        });
+                    }
+                }
+                nonce_start += this_batch as u64;
             }
-            nonce_start += this_batch as u64;
+            // Nonce space exhausted at this timestamp. Bump timestamp and
+            // continue with a fresh 4.3B-nonce search space.
+            current_timestamp = current_timestamp.wrapping_add(1);
+            // Sanity bound: don't drift more than ~1 hour past the
+            // template-issued timestamp; pool may reject shares that far
+            // in the future. If we hit this we're effectively idle until
+            // a new job arrives — better than dying silently.
+            if current_timestamp.saturating_sub(tmpl_initial_timestamp) > 3600 {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                continue 'outer;
+            }
         }
     });
 }
