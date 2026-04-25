@@ -87,6 +87,15 @@ struct Args {
     #[arg(long, default_value_t = 2)]
     poll_secs: u64,
 
+    /// Force-refresh the in-flight template at most this often, even
+    /// when the chain tip hasn't changed. Picks up ASERT difficulty
+    /// drift while the chain stalls (the daemon's getblocktemplate
+    /// returns easier nBits as the proposed-ntime advances). Without
+    /// this, miners are stuck mining against the stale (harder) target
+    /// from the last prev_hash change. Set to 0 to disable.
+    #[arg(long, default_value_t = 15)]
+    refresh_same_tip_secs: u64,
+
     /// Share acceptance target: leading zero bits required on the
     /// header hash for a share to be *credited*. 0 = credit every
     /// structurally valid share. Keep this far looser than the block
@@ -156,9 +165,16 @@ async fn main() -> Result<()> {
         let rpc = rpc.clone();
         let payout = args.payout_address.clone();
         let poll = Duration::from_secs(args.poll_secs);
+        let refresh_same_tip = if args.refresh_same_tip_secs == 0 {
+            None
+        } else {
+            Some(Duration::from_secs(args.refresh_same_tip_secs))
+        };
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(poll);
             let mut last_tip: Option<String> = None;
+            let mut last_template_at: Option<std::time::Instant> = None;
+            let mut last_nbits: Option<u32> = None;
             let mut template_id: u64 = 0;
             loop {
                 ticker.tick().await;
@@ -169,7 +185,13 @@ async fn main() -> Result<()> {
                         continue;
                     }
                 };
-                if last_tip.as_deref() == Some(tip.as_str()) {
+                let tip_changed = last_tip.as_deref() != Some(tip.as_str());
+                let stale_same_tip = match (refresh_same_tip, last_template_at) {
+                    (Some(window), Some(t)) => t.elapsed() >= window,
+                    (Some(_), None) => true,
+                    (None, _) => false,
+                };
+                if !tip_changed && !stale_same_tip {
                     continue;
                 }
                 let gbt = match rpc.get_block_template(&payout).await {
@@ -203,15 +225,28 @@ async fn main() -> Result<()> {
                         warn!(error = %e, "getutreexoroots failed — JD miners won't be able to recompute utreexo_root");
                     }
                 }
+                let nbits_changed = last_nbits != Some(pt.wire.difficulty);
+                if !tip_changed && !nbits_changed {
+                    // Same tip, same nbits — daemon hasn't drifted yet. Skip
+                    // pushing a new job to avoid spamming miners with
+                    // identical NewMiningJob frames.
+                    last_template_at = Some(std::time::Instant::now());
+                    continue;
+                }
                 info!(
                     template_id = pt.wire.template_id,
                     tip = %tip,
+                    nbits = format!("0x{:08x}", pt.wire.difficulty),
+                    nbits_changed,
+                    tip_changed,
                     block_target = %hex::encode(pt.block_target),
                     utreexo_leaves = pt.utreexo_pre_block.as_ref().map(|s| s.num_leaves),
                     "new template"
                 );
-                let _ = tx.send(Some(pt));
+                let _ = tx.send(Some(pt.clone()));
                 last_tip = Some(tip);
+                last_template_at = Some(std::time::Instant::now());
+                last_nbits = Some(pt.wire.difficulty);
             }
         });
     }
