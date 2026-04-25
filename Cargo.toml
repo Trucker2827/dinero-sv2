@@ -16,7 +16,7 @@ members = [
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-repository = "https://github.com/Trucker2827/dinero-sv2"
+repository = "https://github.com/DineroLabs/dinero-sv2"
 authors = ["Dinero Contributors"]
 rust-version = "1.75"
 
