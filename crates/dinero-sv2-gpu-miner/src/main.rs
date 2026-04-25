@@ -38,7 +38,7 @@ use dinero_sv2_transport::{
     MSG_SUBMIT_SHARES_EXTENDED, MSG_SUBMIT_SHARES_SUCCESS, MSG_UTREEXO_STATE,
 };
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpStream;
@@ -256,9 +256,17 @@ async fn run_session(
     let mut blocks_found: u64 = 0;
     let mut seq: u32 = 0;
 
-    let cancel = Arc::new(AtomicBool::new(false));
     let generation = Arc::new(AtomicU64::new(0));
     let (share_tx, mut share_rx) = mpsc::unbounded_channel::<FoundShare>();
+
+    // Coalesce share-accept telemetry. With the GPU running at ~500
+    // shares/sec, emitting a JSON event per pool ack drowns the Qt UI
+    // thread. We collect into a 1-second window and flush a single
+    // summary event per window.
+    let mut acc_window_count: u64 = 0;
+    let mut acc_window_last_seq: u64 = 0;
+    let mut acc_window_started: std::time::Instant = std::time::Instant::now();
+    const ACCEPT_FLUSH_MS: u128 = 1000;
 
     let result: Result<u64> = loop {
         tokio::select! {
@@ -277,7 +285,13 @@ async fn run_session(
                                 "nbits": format!("0x{:08x}", snph.nbits),
                             }),
                         );
-                        cancel.store(true, Ordering::SeqCst);
+                        // Generation bump invalidates any in-flight hashing
+                        // thread immediately (next stale() check returns
+                        // true) — replaces the old `cancel` bool flag,
+                        // which had a race window where a subsequent
+                        // start_hashing_gpu could clear the flag before
+                        // the old thread observed it.
+                        generation.fetch_add(1, Ordering::SeqCst);
                         pre_block_state = None;
                         coinbase_ctx = None;
                     }
@@ -307,7 +321,6 @@ async fn run_session(
                             share_target,
                             gpu.clone(),
                             args.batch_size,
-                            Arc::clone(&cancel),
                             Arc::clone(&generation),
                             share_tx.clone(),
                             emitter,
@@ -315,15 +328,22 @@ async fn run_session(
                     }
                     MSG_SUBMIT_SHARES_SUCCESS => {
                         let s = decode_submit_shares_success(&frame.payload)?;
-                        emitter.emit(
-                            "share_accepted",
-                            &serde_json::json!({
-                                "channel_id": s.channel_id,
-                                "last_seq": s.last_sequence_number,
-                                "accepted_count": s.new_submits_accepted_count,
-                                "shares_sum": s.new_shares_sum,
-                            }),
-                        );
+                        acc_window_count += s.new_submits_accepted_count.max(1) as u64;
+                        acc_window_last_seq = s.last_sequence_number as u64;
+                        if acc_window_started.elapsed().as_millis() >= ACCEPT_FLUSH_MS {
+                            emitter.emit(
+                                "share_accepted",
+                                &serde_json::json!({
+                                    "channel_id": s.channel_id,
+                                    "last_seq": acc_window_last_seq,
+                                    "accepted_count": acc_window_count,
+                                    "shares_sum": s.new_shares_sum,
+                                    "window_ms": acc_window_started.elapsed().as_millis() as u64,
+                                }),
+                            );
+                            acc_window_count = 0;
+                            acc_window_started = std::time::Instant::now();
+                        }
                     }
                     MSG_SUBMIT_SHARES_ERROR => {
                         let e = decode_submit_shares_error(&frame.payload)?;
@@ -357,16 +377,25 @@ async fn run_session(
                 };
                 let buf = encode_submit_shares_extended(&ext)?;
                 writer.write_frame(MSG_SUBMIT_SHARES_EXTENDED, &buf).await?;
-                emitter.emit(
-                    "share_submitted",
-                    &serde_json::json!({
-                        "sequence_number": seq,
-                        "nonce": format!("0x{:08x}", found.nonce),
-                        "hash": hex::encode(found.hash),
-                        "meets_block_target": found.meets_block_target,
-                        "hashes": found.hashes,
-                    }),
-                );
+                // Only emit share_submitted JSON for block-target hits.
+                // Sub-block shares fire ~500/sec at full GPU speed; the
+                // per-event UI-thread cost on the Qt side is the dominant
+                // cause of frontend freeze + stdout pipe back-pressure
+                // that throttled the kernel itself. The pool's
+                // SubmitSharesSuccess stream carries the count we need
+                // ('share_accepted' events, throttled separately).
+                if found.meets_block_target {
+                    emitter.emit(
+                        "share_submitted",
+                        &serde_json::json!({
+                            "sequence_number": seq,
+                            "nonce": format!("0x{:08x}", found.nonce),
+                            "hash": hex::encode(found.hash),
+                            "meets_block_target": true,
+                            "hashes": found.hashes,
+                        }),
+                    );
+                }
                 if found.meets_block_target {
                     blocks_found += 1;
                     if args.max_blocks > 0 && blocks_found >= args.max_blocks {
@@ -446,13 +475,18 @@ fn start_hashing_gpu(
     share_target: [u8; 32],
     gpu: metal_backend::MetalMiner,
     batch_size: u32,
-    cancel: Arc<AtomicBool>,
     generation: Arc<AtomicU64>,
     share_tx: mpsc::UnboundedSender<FoundShare>,
     emitter: &Emitter,
 ) {
+    // Race-free cancellation: each spawned thread captures its own
+    // generation number; if the global counter has moved past it, the
+    // thread is stale and must exit. The previous bool-flag approach had
+    // a window where a new `start_hashing_gpu` call could `cancel=false`
+    // before the old thread observed `cancel=true`, leading to two
+    // dispatch threads racing for the GPU buffer mutex and roughly
+    // halving effective throughput.
     let gen = generation.fetch_add(1, Ordering::SeqCst) + 1;
-    cancel.store(false, Ordering::SeqCst);
 
     let (encoded_filter, _n) = gcs_build(&tmpl.prev_block_hash, &[&payout_script]);
     let filter_hash = gcs_filter_hash(&encoded_filter);
@@ -533,18 +567,23 @@ fn start_hashing_gpu(
     let tmpl_version = tmpl.version;
     let tmpl_id = tmpl.template_id;
 
-    // Hashrate telemetry emitter runs on the hashing thread. Uses a
-    // process-wide atomic so main.rs can hook it — we just write to
-    // stdout via a shared channel later if needed. For now, log to
-    // stderr which Qt's merged-channel reader picks up.
+    // Hashrate telemetry: emit once per second (~500 dispatches at full
+    // GPU speed) instead of once per 64 dispatches. UI panels don't need
+    // 8 Hz updates and the per-event cost on Qt's main thread was the
+    // dominant cause of the observed UI freeze + reverse throughput.
     std::thread::spawn(move || {
+        let gen_at_spawn = gen;
+        let global_generation = Arc::clone(&generation);
+        let stale = move || global_generation.load(Ordering::Relaxed) > gen_at_spawn;
+
         let mut nonce_start: u64 = 0;
         let batch: u64 = batch_size as u64;
-        let mut batches_since_last_report: u32 = 0;
-        let mut total_ms: f64 = 0.0;
-        let mut total_hashes: u64 = 0;
+        let mut total_ms_since_emit: f64 = 0.0;
+        let mut hashes_since_emit: u64 = 0;
+        let mut last_emit = std::time::Instant::now();
+        const EMIT_INTERVAL_MS: u128 = 1000;
         while nonce_start <= u32::MAX as u64 {
-            if cancel.load(Ordering::Relaxed) {
+            if stale() {
                 return;
             }
             let this_batch = std::cmp::min(batch, (u32::MAX as u64 + 1).saturating_sub(nonce_start)) as u32;
@@ -555,12 +594,11 @@ fn start_hashing_gpu(
                     return;
                 }
             };
-            total_ms += outcome.elapsed_ms;
-            total_hashes += this_batch as u64;
-            batches_since_last_report += 1;
-            if batches_since_last_report >= 64 {
-                let mhs = (total_hashes as f64 / (total_ms / 1000.0)) / 1e6;
-                let dispatch_ms = total_ms / batches_since_last_report as f64;
+            total_ms_since_emit += outcome.elapsed_ms;
+            hashes_since_emit += this_batch as u64;
+            if last_emit.elapsed().as_millis() >= EMIT_INTERVAL_MS {
+                let mhs = (hashes_since_emit as f64 / (total_ms_since_emit / 1000.0)) / 1e6;
+                let dispatch_ms = total_ms_since_emit / ((hashes_since_emit as f64) / (batch_size as f64)).max(1.0);
                 // JSON event on stdout so the Qt frontend can parse it
                 // and update the hashrate widget. Kept as a single line
                 // so the merged-channel reader doesn't split it.
@@ -570,9 +608,9 @@ fn start_hashing_gpu(
                     dispatch_ms,
                     nonce_start as u32,
                 );
-                batches_since_last_report = 0;
-                total_ms = 0.0;
-                total_hashes = 0;
+                last_emit = std::time::Instant::now();
+                total_ms_since_emit = 0.0;
+                hashes_since_emit = 0;
             }
             if outcome.found {
                 let nonce = outcome.nonce;
