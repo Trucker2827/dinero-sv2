@@ -133,6 +133,12 @@ async fn async_main() -> Result<()> {
     // increment and the GPU dispatch thread would run forever.
     let generation = Arc::new(AtomicU64::new(0));
 
+    // Rolling measured MH/s × 100 (centi-MH/s, integer atomic). Updated
+    // by the GPU hash thread on each telemetry tick, read at each
+    // reconnect so OpenStandardMiningChannel.nominal_hash_rate_bits
+    // reports the real rate instead of a hardcoded 100 MH/s ballpark.
+    let measured_mhs_x100 = Arc::new(AtomicU64::new(0));
+
     let mut blocks_found: u64 = 0;
     loop {
         match run_session(
@@ -141,6 +147,7 @@ async fn async_main() -> Result<()> {
             &payout_script,
             &gpu,
             Arc::clone(&generation),
+            Arc::clone(&measured_mhs_x100),
             &emitter,
         )
         .await
@@ -204,6 +211,7 @@ async fn run_session(
     payout_script: &[u8],
     gpu: &GpuMiner,
     generation: Arc<AtomicU64>,
+    measured_mhs_x100: Arc<AtomicU64>,
     emitter: &Emitter,
 ) -> Result<u64> {
     let tcp = TcpStream::connect(args.pool).await.context("connect")?;
@@ -232,11 +240,20 @@ async fn run_session(
         .await?;
     expect_setup_success(&mut reader).await?;
 
+    // Use the rolling measured rate from the previous session for the
+    // SV2 channel-open declaration; first connect (atomic still 0)
+    // falls back to the 100 MH/s ballpark so the pool has a non-zero
+    // value to size targets from.
+    let measured = measured_mhs_x100.load(Ordering::Relaxed);
+    let nominal_hps = if measured > 0 {
+        (measured as f32 / 100.0) * 1_000_000.0
+    } else {
+        100_000_000.0
+    };
     let open = OpenStandardMiningChannel {
         request_id: 1,
         user_identity: args.user_agent.as_bytes().to_vec(),
-        // GPU hashrate estimate: 100 MH/s ballpark for Apple Silicon.
-        nominal_hash_rate_bits: f32::to_bits(100_000_000.0),
+        nominal_hash_rate_bits: f32::to_bits(nominal_hps),
         max_target: [0xFFu8; 32],
     };
     writer
@@ -346,6 +363,7 @@ async fn run_session(
                             gpu.clone(),
                             args.batch_size,
                             Arc::clone(&generation),
+                            Arc::clone(&measured_mhs_x100),
                             share_tx.clone(),
                             emitter,
                         );
@@ -418,7 +436,7 @@ async fn run_session(
                             "nonce": format!("0x{:08x}", found.nonce),
                             "hash": hex::encode(found.hash),
                             "meets_block_target": true,
-                            "hashes": found.hashes,
+                            "nonces_searched": found.nonces_searched,
                         }),
                     );
                 }
@@ -510,7 +528,10 @@ struct FoundShare {
     nonce: u32,
     hash: [u8; 32],
     meets_block_target: bool,
-    hashes: u64,
+    /// Total hashes searched at this template before the GPU returned —
+    /// nonces tried at the current timestamp + (`current_timestamp` -
+    /// `tmpl_initial_timestamp`) × 2³² for prior timestamp wraps.
+    nonces_searched: u64,
     coinbase_outputs: Vec<CoinbaseOutputWire>,
 }
 
@@ -528,6 +549,7 @@ fn start_hashing_gpu(
     gpu: GpuMiner,
     batch_size: u32,
     generation: Arc<AtomicU64>,
+    measured_mhs_x100: Arc<AtomicU64>,
     share_tx: mpsc::UnboundedSender<FoundShare>,
     emitter: &Emitter,
 ) {
@@ -645,7 +667,7 @@ fn start_hashing_gpu(
                 let outcome = match gpu.dispatch(&header_bytes, &share_target, nonce_start as u32, this_batch) {
                     Ok(out) => out,
                     Err(err) => {
-                        tracing::error!("metal dispatch failed: {err}");
+                        tracing::error!("gpu dispatch ({}) failed: {err}", BACKEND_NAME);
                         return;
                     }
                 };
@@ -654,6 +676,10 @@ fn start_hashing_gpu(
                 if last_emit.elapsed().as_millis() >= EMIT_INTERVAL_MS {
                     let mhs = (hashes_since_emit as f64 / (total_ms_since_emit / 1000.0)) / 1e6;
                     let dispatch_ms = total_ms_since_emit / ((hashes_since_emit as f64) / (batch_size as f64)).max(1.0);
+                    // Publish process-wide rolling rate so the next
+                    // session's `nominal_hash_rate_bits` reports actual
+                    // measured throughput.
+                    measured_mhs_x100.store((mhs * 100.0).round() as u64, Ordering::Relaxed);
                     println!(
                         "{{\"event\":\"hashrate\",\"mhs\":{:.2},\"dispatch_ms\":{:.3},\"nonce_start\":\"0x{:08x}\",\"timestamp\":{},\"backend\":\"{}\"}}",
                         mhs,
@@ -679,7 +705,14 @@ fn start_hashing_gpu(
                     let hash = HeaderAssembly::hash(&our_template, &share);
                     if hash < share_target {
                         let meets_block = hash < block_target;
-                        let hashes = nonce_start + outcome.nonce.wrapping_sub(nonce_start as u32) as u64;
+                        // Total nonces searched at this template: completed
+                        // wraps × 2³² + nonces tried at the current
+                        // timestamp. `hashes_since_emit` was a misleading
+                        // proxy that just collapsed to `outcome.nonce`.
+                        let timestamp_wraps =
+                            current_timestamp.saturating_sub(tmpl_initial_timestamp);
+                        let nonces_searched =
+                            timestamp_wraps * (1u64 << 32) + outcome.nonce as u64;
                         let _ = share_tx.send(FoundShare {
                             generation: gen,
                             template_id: tmpl_id,
@@ -688,7 +721,7 @@ fn start_hashing_gpu(
                             nonce,
                             hash,
                             meets_block_target: meets_block,
-                            hashes,
+                            nonces_searched,
                             coinbase_outputs: coinbase_outputs_wire.clone(),
                         });
                     }

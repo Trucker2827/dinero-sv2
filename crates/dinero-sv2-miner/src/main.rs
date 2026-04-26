@@ -130,9 +130,25 @@ async fn async_main() -> Result<()> {
     // thread that emitted spurious mhs:0 alongside the real ones.
     let generation = Arc::new(AtomicU64::new(0));
 
+    // Process-wide rolling hashrate, updated by each telemetry thread.
+    // Stored as MH/s × 100 (centi-MH/s) to keep an integer atomic; read
+    // back at each reconnect so `nominal_hash_rate_bits` reports the
+    // measured rate instead of a hardcoded `threads * 3 MH/s` lie.
+    let measured_mhs_x100 = Arc::new(AtomicU64::new(0));
+
     let mut blocks_found: u64 = 0;
     loop {
-        match run_session(&args, pinned.as_ref(), &payout_script, threads, Arc::clone(&generation), &emitter).await {
+        match run_session(
+            &args,
+            pinned.as_ref(),
+            &payout_script,
+            threads,
+            Arc::clone(&generation),
+            Arc::clone(&measured_mhs_x100),
+            &emitter,
+        )
+        .await
+        {
             Ok(round_blocks) => {
                 blocks_found += round_blocks;
                 if args.max_blocks > 0 && blocks_found >= args.max_blocks {
@@ -195,6 +211,7 @@ async fn run_session(
     payout_script: &[u8],
     threads: usize,
     generation: Arc<AtomicU64>,
+    measured_mhs_x100: Arc<AtomicU64>,
     emitter: &Emitter,
 ) -> Result<u64> {
     let tcp = TcpStream::connect(args.pool).await.context("connect")?;
@@ -229,10 +246,22 @@ async fn run_session(
     expect_setup_success(&mut reader).await?;
 
     // ---- OpenStandardMiningChannel ----
+    // Report the rolling measured hashrate from the previous session.
+    // First connect (atomic still 0) falls back to the ballpark guess so
+    // pools have a non-zero value to size targets from. Subsequent
+    // reconnects use the real number, which lets pool-side vardiff
+    // (#11) calibrate share targets to actual capacity instead of a
+    // hardcoded `threads * 3 MH/s` lie.
+    let measured = measured_mhs_x100.load(Ordering::Relaxed);
+    let nominal_hps = if measured > 0 {
+        (measured as f32 / 100.0) * 1_000_000.0
+    } else {
+        (threads as f32) * 3_000_000.0
+    };
     let open = OpenStandardMiningChannel {
         request_id: 1,
         user_identity: args.user_agent.as_bytes().to_vec(),
-        nominal_hash_rate_bits: f32::to_bits((threads as f32) * 3_000_000.0),
+        nominal_hash_rate_bits: f32::to_bits(nominal_hps),
         max_target: [0xFFu8; 32],
     };
     writer
@@ -326,6 +355,7 @@ async fn run_session(
                             threads,
                             Arc::clone(&cancel),
                             Arc::clone(&generation),
+                            Arc::clone(&measured_mhs_x100),
                             share_tx.clone(),
                             emitter,
                         );
@@ -471,6 +501,7 @@ fn start_hashing(
     threads: usize,
     cancel: Arc<AtomicBool>,
     generation: Arc<AtomicU64>,
+    measured_mhs_x100: Arc<AtomicU64>,
     share_tx: mpsc::UnboundedSender<FoundShare>,
     emitter: &Emitter,
 ) {
@@ -563,6 +594,7 @@ fn start_hashing(
     {
         let hashes = Arc::clone(&hashes_done);
         let global_generation = Arc::clone(&generation);
+        let measured = Arc::clone(&measured_mhs_x100);
         let gen_at_spawn = gen;
         let emitter = emitter.clone();
         std::thread::spawn(move || {
@@ -577,6 +609,10 @@ fn start_hashing(
                 let dt = last_instant.elapsed().as_secs_f64();
                 let delta = now.saturating_sub(last);
                 let mhs = (delta as f64 / dt) / 1e6;
+                // Publish to the process-wide rolling rate so the next
+                // reconnect's `nominal_hash_rate_bits` is grounded in
+                // reality, not the static `threads * 3 MH/s` ballpark.
+                measured.store((mhs * 100.0).round() as u64, Ordering::Relaxed);
                 emitter.emit(
                     "hashrate",
                     &serde_json::json!({
