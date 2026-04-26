@@ -278,6 +278,47 @@ async fn main() -> Result<()> {
                         warn!(error = %e, "getutreexoroots failed — JD miners won't be able to recompute utreexo_root");
                     }
                 }
+
+                // Phase 6 mempool inclusion: apply mempool tx
+                // deletions+additions to the chain-tip pre-block state
+                // to derive the pre-coinbase state. Without this, JD
+                // miners can't reconstruct the right utreexo_root when
+                // mempool txs are in the block. If anything fails here
+                // we drop the mempool txs and fall back to a coinbase-
+                // only template (the pool stays alive).
+                if !pt.mempool_txs.is_empty() {
+                    if let Some(pre_block) = pt.utreexo_pre_block.as_ref().cloned() {
+                        match apply_mempool_to_pre_coinbase(&rpc, &pre_block, &pt.mempool_txs).await {
+                            Ok(post) => {
+                                debug!(
+                                    pre_leaves = pre_block.num_leaves,
+                                    post_leaves = post.num_leaves,
+                                    mempool_tx_count = pt.mempool_txs.len(),
+                                    "post-mempool utreexo state derived"
+                                );
+                                pt.utreexo_pre_block = Some(post);
+                            }
+                            Err(e) => {
+                                warn!(
+                                    error = %e,
+                                    mempool_tx_count = pt.mempool_txs.len(),
+                                    "post-mempool utreexo derivation failed — \
+                                     dropping mempool txs from this template"
+                                );
+                                // Coinbase-only fallback: drop the
+                                // mempool tx list, restore the merkle
+                                // root to the bare coinbase txid (the
+                                // header leaf for a single-tx block),
+                                // and let JD miners build their own
+                                // coinbase on the unmodified
+                                // pre-block utreexo state.
+                                pt.mempool_txs.clear();
+                                pt.merkle_path.clear();
+                                pt.wire.merkle_root = pt.coinbase_txid_raw;
+                            }
+                        }
+                    }
+                }
                 let nbits_changed = last_nbits != Some(pt.wire.difficulty);
                 if !tip_changed && !nbits_changed {
                     // Same tip, same nbits — daemon hasn't drifted yet. Skip
@@ -811,7 +852,12 @@ async fn handle_share(
         .await?;
 
     if meets_block {
-        match try_submit_block(&pt.wire, &share, &pt.coinbase_full_hex, rpc).await {
+        let mempool_data: Vec<Vec<u8>> = pt
+            .mempool_txs
+            .iter()
+            .map(|t| t.data.clone())
+            .collect();
+        match try_submit_block(&pt.wire, &share, &pt.coinbase_full_hex, &mempool_data, rpc).await {
             Ok(SubmitBlockResult::Accepted) => {
                 info!(
                     template_id = pt.wire.template_id,
@@ -840,9 +886,11 @@ async fn try_submit_block(
     template: &dinero_sv2_common::NewTemplateDinero,
     share: &SubmitSharesDinero,
     coinbase_full_hex: &str,
+    mempool_tx_data: &[Vec<u8>],
     rpc: &RpcClient,
 ) -> Result<SubmitBlockResult> {
-    let block_hex = block::assemble_block_hex(template, share, coinbase_full_hex)?;
+    let block_hex =
+        block::assemble_block_hex(template, share, coinbase_full_hex, mempool_tx_data)?;
     rpc.submit_block(&block_hex).await
 }
 
@@ -1025,13 +1073,18 @@ async fn handle_extended_share(
         // Reassemble the full block (segwit coinbase) for submitblock:
         //   stripped-coinbase bytes with segwit marker+flag inserted
         //   after version, and the pool-retained witness bytes inserted
-        //   before the locktime.
+        //   before the locktime. Then the mempool tx bytes follow.
         let full_coinbase = wrap_stripped_with_segwit_witness(
             &coinbase_stripped,
             &pt.coinbase_witness_bytes,
             &pt.coinbase_suffix,
         );
-        match block::assemble_block_hex_raw(&reconstructed, &share, &full_coinbase) {
+        let mempool_data: Vec<Vec<u8>> = pt
+            .mempool_txs
+            .iter()
+            .map(|t| t.data.clone())
+            .collect();
+        match block::assemble_block_hex_raw(&reconstructed, &share, &full_coinbase, &mempool_data) {
             Ok(block_hex) => match rpc.submit_block(&block_hex).await {
                 Ok(SubmitBlockResult::Accepted) => {
                     info!("★ extended-share block ACCEPTED by dinerod");
@@ -1111,4 +1164,123 @@ fn count_leading_zero_bits(target: &[u8; 32]) -> u32 {
         }
     }
     bits
+}
+
+/// Apply mempool tx deletions (inputs) and additions (outputs) to the
+/// chain-tip pre-block Utreexo state, producing the pre-coinbase state
+/// that JD miners build their own coinbase on top of.
+///
+/// Pulls inclusion proofs for each input via `getutxoproofs_batch`, then
+/// applies them via `UtreexoAccumulatorState::apply_deletions`, then
+/// adds each tx's outputs as new leaves via `add_leaf` (Utreexo
+/// additions are O(log n) per leaf and don't need any RPC).
+///
+/// Errors propagate to the caller, which falls back to a coinbase-only
+/// template on failure (better an empty block than a wrong utreexo
+/// commitment).
+async fn apply_mempool_to_pre_coinbase(
+    rpc: &rpc::RpcClient,
+    pre_block: &dinero_sv2_jd::UtreexoAccumulatorState,
+    mempool_txs: &[mapper::MempoolTx],
+) -> Result<dinero_sv2_jd::UtreexoAccumulatorState> {
+    use dinero_sv2_jd::{leaf_hash, DeletionTarget};
+
+    // Collect all inputs across all mempool txs. Daemon RPC takes
+    // display-order txid hex.
+    let mut outpoints: Vec<(String, u32)> = Vec::new();
+    for tx in mempool_txs {
+        for (prev_raw, vout) in &tx.inputs {
+            let mut display = *prev_raw;
+            display.reverse();
+            outpoints.push((hex::encode(display), *vout));
+        }
+    }
+
+    // Fetch proofs.
+    let mut deletions: Vec<DeletionTarget> = Vec::with_capacity(outpoints.len());
+    if !outpoints.is_empty() {
+        let resp = rpc
+            .get_utxo_proofs_batch(&outpoints)
+            .await
+            .context("getutxoproofs_batch RPC")?;
+        let proofs = resp
+            .get("proofs")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| anyhow::anyhow!("getutxoproofs_batch: missing proofs[]"))?;
+        if proofs.len() != outpoints.len() {
+            anyhow::bail!(
+                "getutxoproofs_batch returned {} entries for {} requested outpoints",
+                proofs.len(),
+                outpoints.len()
+            );
+        }
+        for (i, p) in proofs.iter().enumerate() {
+            let success = p
+                .get("success")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if !success {
+                let why = p
+                    .get("error")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                anyhow::bail!(
+                    "getutxoproofs_batch: outpoint #{i} ({}:{}) failed: {why}",
+                    outpoints[i].0,
+                    outpoints[i].1
+                );
+            }
+            let leaf_hex = p
+                .get("leaf_hash")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("proof #{i}: missing leaf_hash"))?;
+            let position = p
+                .get("position")
+                .and_then(|v| v.as_u64())
+                .ok_or_else(|| anyhow::anyhow!("proof #{i}: missing position"))?;
+            let siblings_arr = p
+                .get("siblings")
+                .and_then(|v| v.as_array())
+                .ok_or_else(|| anyhow::anyhow!("proof #{i}: missing siblings"))?;
+            let leaf_bytes = hex::decode(leaf_hex)
+                .with_context(|| format!("proof #{i} leaf_hash hex"))?;
+            if leaf_bytes.len() != 32 {
+                anyhow::bail!("proof #{i}: leaf_hash is {} bytes", leaf_bytes.len());
+            }
+            let mut leaf_hash_arr = [0u8; 32];
+            leaf_hash_arr.copy_from_slice(&leaf_bytes);
+            let mut siblings: Vec<[u8; 32]> = Vec::with_capacity(siblings_arr.len());
+            for (j, s) in siblings_arr.iter().enumerate() {
+                let s_hex = s.as_str().ok_or_else(|| {
+                    anyhow::anyhow!("proof #{i} sibling[{j}] not a string")
+                })?;
+                let sb = hex::decode(s_hex)
+                    .with_context(|| format!("proof #{i} sibling[{j}] hex"))?;
+                if sb.len() != 32 {
+                    anyhow::bail!("proof #{i} sibling[{j}] is {} bytes", sb.len());
+                }
+                let mut a = [0u8; 32];
+                a.copy_from_slice(&sb);
+                siblings.push(a);
+            }
+            deletions.push(DeletionTarget {
+                position,
+                leaf_hash: leaf_hash_arr,
+                siblings,
+            });
+        }
+    }
+
+    // Apply deletions, then per-tx output additions.
+    let mut state = pre_block.clone();
+    state
+        .apply_deletions(&deletions)
+        .context("utreexo apply_deletions")?;
+    for tx in mempool_txs {
+        for (vout, (value_una, spk)) in tx.outputs.iter().enumerate() {
+            let leaf = leaf_hash(&tx.txid_raw, vout as u32, *value_una, spk);
+            state.add_leaf(leaf).context("utreexo add_leaf")?;
+        }
+    }
+    Ok(state)
 }

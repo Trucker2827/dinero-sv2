@@ -47,6 +47,33 @@ pub struct PoolTemplate {
     /// Merkle path from the coinbase leaf to the header merkle root.
     /// Empty for coinbase-only blocks (what Phase 5's MVP requires).
     pub merkle_path: Vec<[u8; 32]>,
+    /// Coinbase txid in raw byte order (header merkle leaf for the
+    /// coinbase). Cached so the mempool-fallback path can rebuild a
+    /// coinbase-only `wire.merkle_root` without re-parsing.
+    pub coinbase_txid_raw: [u8; 32],
+    /// Mempool transactions to include after the coinbase, in GBT order.
+    /// Empty in the coinbase-only case. When populated, the pool fetches
+    /// inclusion proofs for each input via `getutxoproofs_batch` and
+    /// applies them to `utreexo_pre_block` to produce
+    /// `utreexo_pre_coinbase` — the state JD miners build their own
+    /// coinbase on top of.
+    pub mempool_txs: Vec<MempoolTx>,
+}
+
+/// One mempool tx: the daemon's serialized form + identity + the leaf
+/// metadata for each output (so the pool can apply additions after
+/// deletions, without re-parsing the wire bytes).
+#[derive(Debug, Clone)]
+pub struct MempoolTx {
+    /// Raw segwit-form tx bytes from `getblocktemplate.transactions[i].data`.
+    pub data: Vec<u8>,
+    /// Stripped (non-segwit) `txid` in raw byte order — the merkle leaf.
+    pub txid_raw: [u8; 32],
+    /// Inputs: `(prev_txid_raw, vout)`. Used to fetch deletion proofs.
+    pub inputs: Vec<([u8; 32], u32)>,
+    /// Outputs: `(value_una, script_pubkey)`. Used to derive Utreexo
+    /// leaf hashes for the additions step.
+    pub outputs: Vec<(u64, Vec<u8>)>,
 }
 
 /// Parse a full (segwit-form) coinbase hex into its pieces:
@@ -205,21 +232,44 @@ pub fn map_template(gbt: &Value, template_id: u64) -> Result<PoolTemplate> {
         .and_then(Value::as_array)
         .map(Vec::as_slice)
         .unwrap_or(&[]);
-    // Phase 6a: don't bail on mempool txs. Build a coinbase-only block
-    // and skip the rest. Real inclusion needs Utreexo deletion proofs
-    // for mempool tx inputs (so JD miners can recompute the post-tx
-    // accumulator state); dinerod's RPC surface doesn't expose those
-    // yet. Until it does, the pool stays alive but blocks mined here
-    // collect only the coinbase reward, no mempool fees.
-    if !tx_list.is_empty() {
-        tracing::warn!(
-            mempool_tx_count = tx_list.len(),
-            "mempool txs present in GBT — pool building coinbase-only \
-             block (mempool fees skipped). Need dinerod utreexo deletion \
-             proofs to include mempool txs in JD-path blocks."
-        );
+
+    // Phase 6: parse mempool txs into structured form. Their leaves
+    // contribute to the merkle root alongside the coinbase. Their
+    // inputs become Utreexo deletions and their outputs become Utreexo
+    // additions, applied in `serve_miner` after fetching deletion
+    // proofs via `getutxoproofs_batch`. Coinbase-only blocks collapse
+    // through with an empty `mempool_txs` and unchanged behaviour.
+    let mut mempool_txs: Vec<MempoolTx> = Vec::with_capacity(tx_list.len());
+    let mut leaves: Vec<[u8; 32]> = Vec::with_capacity(1 + tx_list.len());
+    let coinbase_txid_raw = hex_reverse_32(txid_display)?;
+    leaves.push(coinbase_txid_raw);
+    for (i, t) in tx_list.iter().enumerate() {
+        let tx_data_hex = t
+            .get("data")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("missing transactions[{i}].data"))?;
+        let txid_disp = t
+            .get("txid")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("missing transactions[{i}].txid"))?;
+        let txid_raw = hex_reverse_32(txid_disp)?;
+        leaves.push(txid_raw);
+        let data_bytes = hex::decode(tx_data_hex)
+            .with_context(|| format!("transactions[{i}].data hex"))?;
+        let (inputs, outputs) = parse_segwit_tx_inputs_outputs(&data_bytes)
+            .with_context(|| format!("transactions[{i}] parse"))?;
+        mempool_txs.push(MempoolTx {
+            data: data_bytes,
+            txid_raw,
+            inputs,
+            outputs,
+        });
     }
-    let merkle_root = hex_reverse_32(txid_display)?;
+    let merkle_root = if leaves.len() == 1 {
+        leaves[0]
+    } else {
+        compute_merkle_root_from_leaves(&leaves)
+    };
 
     let coinbase_bytes = hex::decode(&coinbase_full_hex).context("coinbase.data hex")?;
     let coinbase_outputs_commitment = sha256d(&coinbase_bytes);
@@ -247,6 +297,15 @@ pub fn map_template(gbt: &Value, template_id: u64) -> Result<PoolTemplate> {
     let (coinbase_prefix, coinbase_suffix, coinbase_witness_bytes) =
         split_coinbase_segwit(&coinbase_full_hex).context("split_coinbase_segwit")?;
 
+    // Coinbase merkle path: walk the tree of `leaves` and collect the
+    // right-siblings the coinbase sees on its way up. Empty for
+    // coinbase-only.
+    let merkle_path = if leaves.len() <= 1 {
+        Vec::new()
+    } else {
+        coinbase_merkle_path(&leaves)
+    };
+
     Ok(PoolTemplate {
         wire,
         coinbase_full_hex,
@@ -257,8 +316,127 @@ pub fn map_template(gbt: &Value, template_id: u64) -> Result<PoolTemplate> {
         coinbase_prefix,
         coinbase_suffix,
         coinbase_witness_bytes,
-        merkle_path: Vec::new(), // coinbase-only in Phase 5 MVP
+        merkle_path,
+        coinbase_txid_raw,
+        mempool_txs,
     })
+}
+
+/// Walk the tx list (coinbase first, then mempool order) and compute
+/// the same merkle root dinerod's GBT advertised. Bitcoin-style: odd
+/// leaves duplicated at each level, parent = `sha256d(left || right)`.
+fn compute_merkle_root_from_leaves(leaves: &[[u8; 32]]) -> [u8; 32] {
+    debug_assert!(!leaves.is_empty());
+    let mut level: Vec<[u8; 32]> = leaves.to_vec();
+    while level.len() > 1 {
+        let mut next: Vec<[u8; 32]> = Vec::with_capacity(level.len().div_ceil(2));
+        for chunk in level.chunks(2) {
+            let left = chunk[0];
+            let right = if chunk.len() == 2 { chunk[1] } else { chunk[0] };
+            let mut cat = [0u8; 64];
+            cat[..32].copy_from_slice(&left);
+            cat[32..].copy_from_slice(&right);
+            next.push(sha256d(&cat));
+        }
+        level = next;
+    }
+    level[0]
+}
+
+/// Coinbase-leaf merkle path: list of right-siblings the coinbase (leaf
+/// 0) walks past on its way to the merkle root. Each level's sibling is
+/// at index 1; promote pairs (last duplicated on odd levels) and repeat.
+fn coinbase_merkle_path(leaves: &[[u8; 32]]) -> Vec<[u8; 32]> {
+    let mut path: Vec<[u8; 32]> = Vec::new();
+    let mut level: Vec<[u8; 32]> = leaves.to_vec();
+    while level.len() > 1 {
+        // The coinbase sits at index 0 every level, so its sibling is
+        // index 1 (or duplicate when level is just [coinbase]).
+        let sibling = if level.len() >= 2 {
+            level[1]
+        } else {
+            level[0]
+        };
+        path.push(sibling);
+
+        let mut next: Vec<[u8; 32]> = Vec::with_capacity(level.len().div_ceil(2));
+        for chunk in level.chunks(2) {
+            let left = chunk[0];
+            let right = if chunk.len() == 2 { chunk[1] } else { chunk[0] };
+            let mut cat = [0u8; 64];
+            cat[..32].copy_from_slice(&left);
+            cat[32..].copy_from_slice(&right);
+            next.push(sha256d(&cat));
+        }
+        level = next;
+    }
+    path
+}
+
+/// Parse a segwit-form Bitcoin/Dinero tx into `(inputs, outputs)` where
+/// inputs = `[(prev_txid_raw, vout), ...]` and outputs =
+/// `[(value_una, script_pubkey_bytes), ...]`. Witness data, locktime,
+/// and version are skipped — the pool re-emits the daemon's verbatim
+/// `data` bytes for submitblock, so we only need the structured slices
+/// we'll feed to Utreexo apply_deletions / leaf_hash.
+fn parse_segwit_tx_inputs_outputs(
+    bytes: &[u8],
+) -> Result<(Vec<([u8; 32], u32)>, Vec<(u64, Vec<u8>)>)> {
+    let mut cur = 0usize;
+    if bytes.len() < 10 {
+        bail!("tx too short ({} bytes)", bytes.len());
+    }
+    cur += 4; // version
+    let has_witness = bytes.get(cur) == Some(&0x00) && bytes.get(cur + 1) == Some(&0x01);
+    if has_witness {
+        cur += 2;
+    }
+    let (in_count, n) = read_compact_size(bytes, cur)?;
+    cur += n;
+    let mut inputs: Vec<([u8; 32], u32)> = Vec::with_capacity(in_count as usize);
+    for _ in 0..in_count {
+        if cur + 36 > bytes.len() {
+            bail!("input prevout overflow");
+        }
+        let mut prev_txid = [0u8; 32];
+        prev_txid.copy_from_slice(&bytes[cur..cur + 32]);
+        cur += 32;
+        let mut vout_arr = [0u8; 4];
+        vout_arr.copy_from_slice(&bytes[cur..cur + 4]);
+        let vout = u32::from_le_bytes(vout_arr);
+        cur += 4;
+        let (ss_len, n2) = read_compact_size(bytes, cur)?;
+        cur += n2 + ss_len as usize;
+        cur += 4; // sequence
+        // dinerod's `getutxoproofs_batch` takes display-order txid, so
+        // callers will reverse `prev_txid` before issuing the RPC. We
+        // store raw here for symmetry with the rest of the codebase
+        // ("raw is what consensus uses").
+        inputs.push((prev_txid, vout));
+    }
+    let (out_count, n3) = read_compact_size(bytes, cur)?;
+    cur += n3;
+    let mut outputs: Vec<(u64, Vec<u8>)> = Vec::with_capacity(out_count as usize);
+    for _ in 0..out_count {
+        if cur + 8 > bytes.len() {
+            bail!("output value overflow");
+        }
+        let mut val_arr = [0u8; 8];
+        val_arr.copy_from_slice(&bytes[cur..cur + 8]);
+        let value_una = u64::from_le_bytes(val_arr);
+        cur += 8;
+        let (spk_len, n4) = read_compact_size(bytes, cur)?;
+        cur += n4;
+        if cur + spk_len as usize > bytes.len() {
+            bail!("output scriptpubkey overflow");
+        }
+        let spk = bytes[cur..cur + spk_len as usize].to_vec();
+        cur += spk_len as usize;
+        outputs.push((value_una, spk));
+    }
+    // We don't need to walk the witness section or locktime — the raw
+    // `data` is preserved verbatim for submitblock.
+    Ok((inputs, outputs))
 }
 
 /// Parse `getutreexoroots` RPC response into a [`UtreexoAccumulatorState`].

@@ -44,6 +44,7 @@ pub use coinbase::{assemble_stripped_coinbase, CoinbaseOutput, CoinbaseOutputs};
 pub use merkle::{compute_root, MerkleError, MerklePath};
 pub use messages::NewTemplateDineroJD;
 pub use utreexo::{
-    commitment, leaf_hash, node_hash, UtreexoAccumulatorState, UtreexoError, LEAF_DOMAIN_TAG,
-    NODE_DOMAIN_TAG,
+    commitment, leaf_hash, node_hash, tree_height_for_position, tree_start_position,
+    DeletionTarget, UtreexoAccumulatorState, UtreexoError, LEAF_DOMAIN_TAG, NODE_DOMAIN_TAG,
+    ZERO_HASH,
 };

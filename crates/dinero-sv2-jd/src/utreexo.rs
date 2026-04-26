@@ -133,6 +133,33 @@ pub enum UtreexoError {
         /// Leaves the caller asked us to add.
         adding: usize,
     },
+    /// A deletion target's `position` falls outside the populated forest.
+    #[error("deletion position {position} out of range (num_leaves={num_leaves})")]
+    PositionOutOfRange {
+        /// Offending position.
+        position: u64,
+        /// Forest's leaf count.
+        num_leaves: u64,
+    },
+}
+
+/// One leaf to remove from the accumulator. Mirrors the per-outpoint
+/// payload returned by dinerod's `getutxoproof` / `getutxoproofs_batch`
+/// RPC: position in the forest, the leaf's hash, and the per-level
+/// sibling chain from leaf to a forest root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeletionTarget {
+    /// Absolute leaf position (matches dinerod's `UTXOPositionIndex`).
+    pub position: u64,
+    /// Hash of the leaf being deleted (mostly informational here — the
+    /// algorithm replaces it with `None` in level_nodes[0] and never
+    /// needs the original value, but JD-aware callers carry it through
+    /// for proof verification).
+    pub leaf_hash: [u8; 32],
+    /// Sibling chain from leaf upward to the tree's root. Length =
+    /// tree height. `siblings[0]` is the leaf's immediate sibling,
+    /// `siblings[1]` its parent's sibling, etc.
+    pub siblings: Vec<[u8; 32]>,
 }
 
 impl UtreexoAccumulatorState {
@@ -204,6 +231,220 @@ impl UtreexoAccumulatorState {
         }
         Ok(())
     }
+
+    /// Lazy-delete the given leaves from the accumulator (Utreexo-style:
+    /// `num_leaves` does NOT decrement; deleted positions remain in the
+    /// position space, just become unreachable through proofs).
+    ///
+    /// Mirrors `UtreexoStump::applyDeletions` at
+    /// `src/consensus/utreexo_stump.cpp:571-667`. Multi-target,
+    /// multi-tree, sparse-level recomputation. The algorithm is:
+    ///
+    /// 1. Group targets by tree height.
+    /// 2. Per affected tree, sort targets by ascending local position;
+    ///    build sparse `level_nodes[L][local_pos] -> Option<hash>` maps.
+    ///    Mark deleted leaves as `None` at level 0; place each target's
+    ///    sibling-chain into the maps at `(level, (local_pos>>level) ^ 1)`,
+    ///    skipping positions already populated (so a sibling that's
+    ///    itself a deleted leaf stays `None`, not the proof's stale
+    ///    pre-deletion value).
+    /// 3. Bottom-up: at each level, walk unique parent positions; combine
+    ///    children with [`node_hash`]. Missing-child + present-child →
+    ///    parent is `node_hash(ZERO, child)` or `node_hash(child, ZERO)`;
+    ///    both missing → parent stays `None` (subtree fully deleted).
+    /// 4. Replace the tree's forest root with `level_nodes[H][0]` if
+    ///    populated; otherwise (subtree fully deleted) leave the root
+    ///    in place — the subsequent re-proofs will catch it.
+    ///
+    /// Used by the SV2 pool to apply mempool tx input deletions before
+    /// adding mempool tx output additions, reaching the post-mempool
+    /// pre-coinbase Utreexo state that JD miners need to recompute the
+    /// header `utreexo_root`.
+    pub fn apply_deletions(&mut self, targets: &[DeletionTarget]) -> Result<(), UtreexoError> {
+        if targets.is_empty() {
+            return Ok(());
+        }
+        self.validate()?;
+
+        // Step 1: bucket targets by tree height. The position's
+        // tree-height (= forest_roots index for that height bit) lives
+        // in `tree_height_for_position`.
+        use std::collections::HashMap;
+        let mut by_tree: HashMap<u8, Vec<usize>> = HashMap::new();
+        for (i, t) in targets.iter().enumerate() {
+            if t.position >= self.num_leaves {
+                return Err(UtreexoError::PositionOutOfRange {
+                    position: t.position,
+                    num_leaves: self.num_leaves,
+                });
+            }
+            let h = tree_height_for_position(self.num_leaves, t.position);
+            by_tree.entry(h).or_default().push(i);
+        }
+
+        // Step 2: per affected tree, build sparse level maps and recompute.
+        for (height, mut indices) in by_tree {
+            // Tree must exist in the forest (bit set in num_leaves).
+            if (self.num_leaves >> height) & 1 == 0 {
+                // Position fell into a height that isn't part of this
+                // forest — caller passed a stale position. Treat as
+                // out-of-range.
+                return Err(UtreexoError::PositionOutOfRange {
+                    position: targets[indices[0]].position,
+                    num_leaves: self.num_leaves,
+                });
+            }
+            let tree_start = tree_start_position(self.num_leaves, height);
+
+            // Sort by ascending local position so siblings are processed
+            // in a stable order; matches the C++ guard.
+            indices.sort_by_key(|&i| targets[i].position);
+
+            // level_nodes[L][local_pos] = Some(hash) | None (= deleted).
+            let h_usize = height as usize;
+            let mut level_nodes: Vec<HashMap<u64, Option<[u8; 32]>>> =
+                (0..=h_usize).map(|_| HashMap::new()).collect();
+
+            // Step 2a: mark deleted leaves as None at level 0.
+            for &idx in &indices {
+                let local_pos = targets[idx].position - tree_start;
+                level_nodes[0].insert(local_pos, None);
+            }
+
+            // Step 2b: place sibling hashes. For each target's sibling
+            // chain, position `(local_pos >> level) ^ 1` at each level.
+            // Skip positions already populated — a sibling that's itself
+            // a deletion target must remain None, not the proof's stale
+            // pre-deletion hash.
+            for &idx in &indices {
+                let t = &targets[idx];
+                let local_pos = t.position - tree_start;
+                for (level, sib) in t.siblings.iter().enumerate() {
+                    if level >= h_usize {
+                        break;
+                    }
+                    let sib_pos = (local_pos >> level) ^ 1;
+                    level_nodes[level].entry(sib_pos).or_insert(Some(*sib));
+                }
+            }
+
+            // Step 3: bottom-up recomputation up to the tree height.
+            for level in 0..h_usize {
+                let parent_positions: Vec<u64> = level_nodes[level]
+                    .keys()
+                    .map(|pos| pos >> 1)
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .into_iter()
+                    .collect();
+
+                for pp in parent_positions {
+                    let left_pos = pp << 1;
+                    let right_pos = left_pos | 1;
+                    let left_val = level_nodes[level].get(&left_pos).copied();
+                    let right_val = level_nodes[level].get(&right_pos).copied();
+
+                    // `Option<Option<[u8;32]>>`:
+                    //   None        = position absent → unaffected, treat as ZERO_HASH only when needed
+                    //   Some(None)  = position deleted → empty
+                    //   Some(Some(h)) = position has a known hash
+                    let parent: Option<[u8; 32]> = match (left_val, right_val) {
+                        (Some(Some(l)), Some(Some(r))) => Some(node_hash(&l, &r)),
+                        (Some(Some(l)), Some(None)) => Some(node_hash(&l, &ZERO_HASH)),
+                        (Some(None), Some(Some(r))) => Some(node_hash(&ZERO_HASH, &r)),
+                        (Some(None), Some(None)) => None,
+                        // One side present in the level map, the other
+                        // entirely absent (no proof entry, no deletion).
+                        // The absent side is a still-intact subtree whose
+                        // hash we don't have here — but it's guaranteed
+                        // unaffected (no deletion under it), so we can't
+                        // recompute the parent without that hash. Skip
+                        // this parent: the existing forest root for the
+                        // tree carries the correct hash already.
+                        (Some(_), None) | (None, Some(_)) => continue,
+                        (None, None) => continue,
+                    };
+                    level_nodes[level + 1].insert(pp, parent);
+                }
+            }
+
+            // Step 4: extract the new tree root.
+            if let Some(new_root) = level_nodes[h_usize].get(&0).copied() {
+                let root_idx_in_forest = count_ones_below(self.num_leaves, h_usize);
+                match new_root {
+                    Some(h) => self.forest_roots[root_idx_in_forest] = h,
+                    None => {
+                        // Whole subtree deleted — replace with ZERO_HASH.
+                        // The bit stays set in num_leaves (Utreexo lazy
+                        // deletion semantics); subsequent additions still
+                        // merge against this zeroed root.
+                        self.forest_roots[root_idx_in_forest] = ZERO_HASH;
+                    }
+                }
+            }
+            // If level_nodes[H][0] absent, it means no deletion path
+            // climbed to the root — root stays as-is. Shouldn't happen
+            // when at least one target was in this tree, but harmless.
+        }
+
+        Ok(())
+    }
+}
+
+/// 32 bytes of zero. Used as the "empty" sibling when one child of an
+/// internal node has been entirely deleted (lazy deletion semantics).
+pub const ZERO_HASH: [u8; 32] = [0u8; 32];
+
+/// Tree height (= forest_roots height index) containing the given
+/// absolute leaf position. Trees are laid out MSB-first in position
+/// space (largest tree first). Mirrors
+/// `UtreexoStump::getRootIndexForPosition` at
+/// `src/consensus/utreexo_stump.cpp:444-470` — same scan, MSB→LSB.
+pub fn tree_height_for_position(num_leaves: u64, position: u64) -> u8 {
+    if num_leaves == 0 {
+        return 0;
+    }
+    let mut max_bit: i32 = 63;
+    while max_bit >= 0 && ((num_leaves >> max_bit) & 1) == 0 {
+        max_bit -= 1;
+    }
+    let mut offset: u64 = 0;
+    let mut h = max_bit;
+    while h >= 0 {
+        if (num_leaves >> h) & 1 == 1 {
+            let tree_size: u64 = 1u64 << h;
+            if position < offset + tree_size {
+                return h as u8;
+            }
+            offset += tree_size;
+        }
+        h -= 1;
+    }
+    0
+}
+
+/// First absolute position of the tree at the given `height` in the
+/// forest. Mirrors `UtreexoStump::getTreeStartPosition` at
+/// `src/consensus/utreexo_stump.cpp:552-569`.
+pub fn tree_start_position(num_leaves: u64, height: u8) -> u64 {
+    if num_leaves == 0 {
+        return 0;
+    }
+    let mut max_bit: i32 = 63;
+    while max_bit >= 0 && ((num_leaves >> max_bit) & 1) == 0 {
+        max_bit -= 1;
+    }
+    let mut offset: u64 = 0;
+    let mut h = max_bit;
+    while h >= 0 {
+        if (num_leaves >> h) & 1 == 1 {
+            if h as u8 == height {
+                return offset;
+            }
+            offset += 1u64 << h;
+        }
+        h -= 1;
+    }
+    0
 }
 
 /// Compute the Utreexo `utreexo_commitment` that goes into a Dinero
@@ -343,6 +584,178 @@ mod tests {
         let left_root = node_hash(&leaf(1), &leaf(2));
         let right_root = node_hash(&leaf(3), &leaf(4));
         assert_eq!(s.forest_roots[0], node_hash(&left_root, &right_root));
+    }
+
+    #[test]
+    fn tree_height_for_position_layout() {
+        // num_leaves = 0b1011 = 11. Trees: height 3 (size 8), height 1 (size 2),
+        // height 0 (size 1). Layout MSB-first:
+        //   tree height 3 → positions [0, 8)
+        //   tree height 1 → positions [8, 10)
+        //   tree height 0 → position 10
+        assert_eq!(tree_height_for_position(11, 0), 3);
+        assert_eq!(tree_height_for_position(11, 7), 3);
+        assert_eq!(tree_height_for_position(11, 8), 1);
+        assert_eq!(tree_height_for_position(11, 9), 1);
+        assert_eq!(tree_height_for_position(11, 10), 0);
+
+        assert_eq!(tree_start_position(11, 3), 0);
+        assert_eq!(tree_start_position(11, 1), 8);
+        assert_eq!(tree_start_position(11, 0), 10);
+    }
+
+    #[test]
+    fn delete_leaf_in_two_leaf_tree_zeros_left_child() {
+        // num_leaves=2, tree of height 1. Root = node_hash(L1, L2).
+        // Delete leaf at position 0; sibling = leaf 2.
+        // Expected new root = node_hash(ZERO, L2).
+        let mut s = UtreexoAccumulatorState::empty();
+        s.add_leaves(&[leaf(1), leaf(2)]).unwrap();
+        let original_root = s.forest_roots[0];
+        let expected_after = node_hash(&ZERO_HASH, &leaf(2));
+        assert_ne!(original_root, expected_after);
+
+        s.apply_deletions(&[DeletionTarget {
+            position: 0,
+            leaf_hash: leaf(1),
+            siblings: vec![leaf(2)],
+        }])
+        .unwrap();
+        assert_eq!(s.num_leaves, 2, "deletion does not decrement num_leaves");
+        assert_eq!(s.forest_roots[0], expected_after);
+    }
+
+    #[test]
+    fn delete_both_children_zeros_subtree_root_to_zero() {
+        // Delete L1 + L2 in a 2-leaf tree → entire tree becomes empty.
+        // New root = ZERO_HASH (forest_roots slot replaced with zeros;
+        // num_leaves bit stays set per Utreexo lazy-deletion).
+        let mut s = UtreexoAccumulatorState::empty();
+        s.add_leaves(&[leaf(1), leaf(2)]).unwrap();
+        s.apply_deletions(&[
+            DeletionTarget {
+                position: 0,
+                leaf_hash: leaf(1),
+                siblings: vec![leaf(2)],
+            },
+            DeletionTarget {
+                position: 1,
+                leaf_hash: leaf(2),
+                siblings: vec![leaf(1)],
+            },
+        ])
+        .unwrap();
+        assert_eq!(s.num_leaves, 2);
+        assert_eq!(s.forest_roots[0], ZERO_HASH);
+    }
+
+    #[test]
+    fn delete_left_pair_in_four_leaf_tree() {
+        // Tree of height 2, root = node_hash(node_hash(L1,L2), node_hash(L3,L4)).
+        // Delete positions 0 and 1 (L1, L2). The left subtree's parent
+        // becomes None (both children empty). The right subtree's
+        // parent stays intact = node_hash(L3, L4).
+        // New tree root = node_hash(ZERO, node_hash(L3, L4)).
+        let mut s = UtreexoAccumulatorState::empty();
+        s.add_leaves(&[leaf(1), leaf(2), leaf(3), leaf(4)]).unwrap();
+        let right_subtree = node_hash(&leaf(3), &leaf(4));
+        let expected_after = node_hash(&ZERO_HASH, &right_subtree);
+        s.apply_deletions(&[
+            // L1's siblings: L2 at level 0, then node_hash(L3,L4) at level 1.
+            DeletionTarget {
+                position: 0,
+                leaf_hash: leaf(1),
+                siblings: vec![leaf(2), right_subtree],
+            },
+            // L2's siblings: L1 at level 0, same right_subtree at level 1.
+            DeletionTarget {
+                position: 1,
+                leaf_hash: leaf(2),
+                siblings: vec![leaf(1), right_subtree],
+            },
+        ])
+        .unwrap();
+        assert_eq!(s.forest_roots[0], expected_after);
+    }
+
+    #[test]
+    fn delete_one_leaf_in_four_leaf_tree() {
+        // Delete L1 only. Sibling at level 0 = L2. Sibling at level 1 =
+        // node_hash(L3, L4). New parent of L1's level-0 pair =
+        // node_hash(ZERO, L2). Tree root = node_hash(that, node_hash(L3, L4)).
+        let mut s = UtreexoAccumulatorState::empty();
+        s.add_leaves(&[leaf(1), leaf(2), leaf(3), leaf(4)]).unwrap();
+        let right_subtree = node_hash(&leaf(3), &leaf(4));
+        let expected_left_after = node_hash(&ZERO_HASH, &leaf(2));
+        let expected_root = node_hash(&expected_left_after, &right_subtree);
+        s.apply_deletions(&[DeletionTarget {
+            position: 0,
+            leaf_hash: leaf(1),
+            siblings: vec![leaf(2), right_subtree],
+        }])
+        .unwrap();
+        assert_eq!(s.forest_roots[0], expected_root);
+    }
+
+    #[test]
+    fn delete_in_multi_tree_forest() {
+        // num_leaves = 3 → trees: height 1 ([L1,L2]), height 0 (L3).
+        // forest_roots layout (smallest-first): [L3, node_hash(L1, L2)].
+        // Delete L1 at position 0 in the height-1 tree.
+        // After: tree root → node_hash(ZERO, L2). L3 untouched.
+        let mut s = UtreexoAccumulatorState::empty();
+        s.add_leaves(&[leaf(1), leaf(2), leaf(3)]).unwrap();
+        let expected_height1_after = node_hash(&ZERO_HASH, &leaf(2));
+        s.apply_deletions(&[DeletionTarget {
+            position: 0,
+            leaf_hash: leaf(1),
+            siblings: vec![leaf(2)],
+        }])
+        .unwrap();
+        assert_eq!(s.num_leaves, 3);
+        assert_eq!(s.forest_roots.len(), 2);
+        // forest_roots[0] is height-0 tree (L3), unchanged.
+        assert_eq!(s.forest_roots[0], leaf(3));
+        // forest_roots[1] is height-1 tree, post-deletion.
+        assert_eq!(s.forest_roots[1], expected_height1_after);
+    }
+
+    #[test]
+    fn delete_then_add_yields_consistent_commitment() {
+        // Deletion semantics shouldn't break add_leaf: after a deletion
+        // the next add_leaf should still merge/promote correctly.
+        let mut s = UtreexoAccumulatorState::empty();
+        s.add_leaves(&[leaf(1), leaf(2)]).unwrap();
+        s.apply_deletions(&[DeletionTarget {
+            position: 0,
+            leaf_hash: leaf(1),
+            siblings: vec![leaf(2)],
+        }])
+        .unwrap();
+        // num_leaves still 2, so adding leaf(5) goes into slot 0 and
+        // immediately merges with the (zero-replaced) height-1 tree to
+        // form a height-2 tree.
+        s.add_leaf(leaf(5)).unwrap();
+        // Wait — bit 0 was clear after the previous merge, so leaf(5)
+        // sits as a new height-0 root. num_leaves becomes 3.
+        assert_eq!(s.num_leaves, 3);
+        assert_eq!(s.forest_roots.len(), 2);
+        assert_eq!(s.forest_roots[0], leaf(5));
+        assert_eq!(s.forest_roots[1], node_hash(&ZERO_HASH, &leaf(2)));
+    }
+
+    #[test]
+    fn delete_rejects_out_of_range_position() {
+        let mut s = UtreexoAccumulatorState::empty();
+        s.add_leaves(&[leaf(1), leaf(2)]).unwrap();
+        let err = s
+            .apply_deletions(&[DeletionTarget {
+                position: 99,
+                leaf_hash: leaf(99),
+                siblings: vec![],
+            }])
+            .unwrap_err();
+        assert!(matches!(err, UtreexoError::PositionOutOfRange { .. }));
     }
 
     #[test]

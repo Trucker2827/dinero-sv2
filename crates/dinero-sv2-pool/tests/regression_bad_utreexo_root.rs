@@ -306,7 +306,7 @@ async fn submitblock_rejects_tampered_utreexo_root() -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("no nonce found for valid block"))?;
     let mut share_ok = share_tmpl.clone();
     share_ok.nonce = nonce_ok;
-    let block_hex_ok = assemble_block_hex(&pt_ok.wire, &share_ok, &pt_ok.coinbase_full_hex)?;
+    let block_hex_ok = assemble_block_hex(&pt_ok.wire, &share_ok, &pt_ok.coinbase_full_hex, &[])?;
     match rpc.submit_block(&block_hex_ok).await? {
         SubmitBlockResult::Accepted => {}
         SubmitBlockResult::Rejected(r) => {
@@ -338,7 +338,7 @@ async fn submitblock_rejects_tampered_utreexo_root() -> Result<()> {
     let mut share_bad = share_tmpl_bad.clone();
     share_bad.nonce = nonce_bad;
     let block_hex_bad =
-        assemble_block_hex(&tampered_wire, &share_bad, &pt_bad.coinbase_full_hex)?;
+        assemble_block_hex(&tampered_wire, &share_bad, &pt_bad.coinbase_full_hex, &[])?;
 
     let rejection = match rpc.submit_block(&block_hex_bad).await? {
         SubmitBlockResult::Accepted => {
@@ -479,7 +479,7 @@ async fn side_chain_tampered_utreexo_root() -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("no nonce found for tampered side-chain block"))?;
     let mut share = share_tmpl.clone();
     share.nonce = nonce;
-    let block_hex = assemble_block_hex(&tampered, &share, &pt_side.coinbase_full_hex)?;
+    let block_hex = assemble_block_hex(&tampered, &share, &pt_side.coinbase_full_hex, &[])?;
 
     // 4. Submit. Record outcome.
     let outcome = rpc.submit_block(&block_hex).await?;

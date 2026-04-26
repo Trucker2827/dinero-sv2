@@ -126,6 +126,31 @@ impl RpcClient {
         self.call("getutreexoroots", serde_json::json!([])).await
     }
 
+    /// Fetch Utreexo inclusion proofs for a batch of outpoints. The
+    /// daemon returns `(leaf_hash, position, num_leaves, siblings,
+    /// script_pubkey)` per outpoint — exactly what
+    /// `UtreexoAccumulatorState::apply_deletions` consumes after we
+    /// hex-decode the hashes and siblings.
+    ///
+    /// Caller passes a slice of `(txid_display_hex, vout)`. Errors out
+    /// if the daemon returns a non-success entry for ANY outpoint —
+    /// since a single missing input invalidates the whole post-mempool
+    /// utreexo state.
+    pub async fn get_utxo_proofs_batch(
+        &self,
+        outpoints: &[(String, u32)],
+    ) -> Result<Value> {
+        let arr: Vec<Value> = outpoints
+            .iter()
+            .map(|(txid, vout)| serde_json::json!({"txid": txid, "vout": vout}))
+            .collect();
+        self.call(
+            "getutxoproofs_batch",
+            serde_json::json!([{ "outpoints": arr }]),
+        )
+        .await
+    }
+
     /// Submit a serialized block (hex).
     ///
     /// Dinero's `submitblock` returns `null` on acceptance (BIP22) but
