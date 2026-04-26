@@ -27,8 +27,8 @@ use dinero_sv2_codec::{
     decode_open_standard_mining_channel, decode_setup_connection, decode_submit_shares,
     decode_submit_shares_extended, encode_coinbase_context, encode_new_template,
     encode_open_standard_mining_channel_error, encode_open_standard_mining_channel_success,
-    encode_set_new_prev_hash, encode_setup_connection_error, encode_setup_connection_success,
-    encode_submit_shares_error, encode_submit_shares_success,
+    encode_set_new_prev_hash, encode_set_target, encode_setup_connection_error,
+    encode_setup_connection_success, encode_submit_shares_error, encode_submit_shares_success,
 };
 use dinero_sv2_common::{
     CoinbaseContext, HeaderAssembly, NewTemplateDinero, OpenStandardMiningChannelError,
@@ -45,7 +45,7 @@ use dinero_sv2_transport::{
     Frame, NoiseSession, StaticKeys, MSG_COINBASE_CONTEXT, MSG_NEW_MINING_JOB,
     MSG_OPEN_STANDARD_MINING_CHANNEL, MSG_OPEN_STANDARD_MINING_CHANNEL_ERROR,
     MSG_OPEN_STANDARD_MINING_CHANNEL_SUCCESS, MSG_SETUP_CONNECTION, MSG_SETUP_CONNECTION_ERROR,
-    MSG_SETUP_CONNECTION_SUCCESS, MSG_SET_NEW_PREV_HASH, MSG_SUBMIT_SHARES_ERROR,
+    MSG_SETUP_CONNECTION_SUCCESS, MSG_SET_NEW_PREV_HASH, MSG_SET_TARGET, MSG_SUBMIT_SHARES_ERROR,
     MSG_SUBMIT_SHARES_EXTENDED, MSG_SUBMIT_SHARES_STANDARD, MSG_SUBMIT_SHARES_SUCCESS,
     MSG_UTREEXO_STATE,
 };
@@ -56,7 +56,18 @@ use tracing::{debug, info, warn};
 use crate::accounting::{Ledger, MinerKey};
 use crate::mapper::PoolTemplate;
 use crate::rpc::{Auth, RpcClient, SubmitBlockResult};
-use crate::target::{hash_meets_target, leading_zero_bits_target};
+use crate::target::{hash_meets_target, leading_zero_bits_target, target_for_hashrate};
+
+/// Per-channel vardiff config. `None` = vardiff off (use fallback target
+/// from `--share-leading-bits` for everyone, legacy behaviour).
+#[derive(Debug, Clone, Copy)]
+struct VardiffConfig {
+    /// Target ~1 share per N seconds per channel.
+    target_interval_secs: f64,
+    /// Recompute observed-rate-based target every N seconds. `None`
+    /// means "initial target only, no follow-up retargeting".
+    window: Option<Duration>,
+}
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -99,12 +110,29 @@ struct Args {
     #[arg(long, default_value_t = 15)]
     refresh_same_tip_secs: u64,
 
-    /// Share acceptance target: leading zero bits required on the
-    /// header hash for a share to be *credited*. 0 = credit every
-    /// structurally valid share. Keep this far looser than the block
-    /// target so miners get regular feedback.
+    /// Fallback share-acceptance target as leading zero bits. Used as
+    /// the channel's target ONLY when vardiff can't infer a real
+    /// hashrate (miner reports 0 in OpenStandardMiningChannel and never
+    /// produces a share). With vardiff active, each channel's effective
+    /// target is sized off the miner's reported / observed hashrate.
     #[arg(long, default_value_t = 8)]
     share_leading_bits: u32,
+
+    /// Vardiff target: aim for ~1 accepted share per N seconds per
+    /// channel. Smaller = faster UI feedback, more share traffic; larger
+    /// = sparser shares, less network/log noise. Set to 0 to disable
+    /// vardiff and use `--share-leading-bits` for everyone (legacy).
+    #[arg(long, default_value_t = 5)]
+    vardiff_target_seconds: u64,
+
+    /// Vardiff measurement window: recompute the per-channel target
+    /// every N seconds based on observed share rate. The new target is
+    /// emitted as `MSG_SET_TARGET` (0x22). Forward-compatible — clients
+    /// that don't recognise the opcode keep mining at their channel-open
+    /// target. Set to 0 to disable runtime adjustment (initial target
+    /// from `nominal_hash_rate_bits` only, no follow-up).
+    #[arg(long, default_value_t = 30)]
+    vardiff_window_seconds: u64,
 
     /// Static Noise identity file.
     #[arg(long)]
@@ -158,7 +186,25 @@ async fn main() -> Result<()> {
         .with_context(|| format!("binding {}", args.bind))?;
     info!(bind = %args.bind, "dinero-sv2-pool listening");
 
-    let share_target = leading_zero_bits_target(args.share_leading_bits);
+    let share_target_fallback = leading_zero_bits_target(args.share_leading_bits);
+    let vardiff = if args.vardiff_target_seconds == 0 {
+        None
+    } else {
+        Some(VardiffConfig {
+            target_interval_secs: args.vardiff_target_seconds as f64,
+            window: if args.vardiff_window_seconds == 0 {
+                None
+            } else {
+                Some(Duration::from_secs(args.vardiff_window_seconds))
+            },
+        })
+    };
+    info!(
+        vardiff_target_seconds = args.vardiff_target_seconds,
+        vardiff_window_seconds = args.vardiff_window_seconds,
+        share_leading_bits = args.share_leading_bits,
+        "share difficulty policy"
+    );
     let ledger = Arc::new(Ledger::default());
     // Per-connection channel id allocator. Channel 1 is reserved as the
     // historical default; new connections take 2, 3, … so pool logs and
@@ -264,9 +310,10 @@ async fn main() -> Result<()> {
         let rx = rx.clone();
         let rpc = rpc.clone();
         let ledger = ledger.clone();
-        let share_target_copy = share_target;
+        let share_target_copy = share_target_fallback;
         let keys = static_keys.clone();
         let channel_id = next_channel_id.fetch_add(1, Ordering::Relaxed);
+        let vardiff_copy = vardiff;
         tokio::spawn(async move {
             info!(%peer, channel_id, "miner connected — handshake starting");
             let session = match NoiseSession::accept_nx(sock, &keys).await {
@@ -282,6 +329,7 @@ async fn main() -> Result<()> {
                 session,
                 rx,
                 share_target_copy,
+                vardiff_copy,
                 miner_key,
                 rpc,
                 ledger,
@@ -310,7 +358,8 @@ fn default_pool_key_path() -> PathBuf {
 async fn serve_miner(
     mut session: NoiseSession<TcpStream>,
     mut rx: watch::Receiver<Option<PoolTemplate>>,
-    share_target: [u8; 32],
+    share_target_fallback: [u8; 32],
+    vardiff: Option<VardiffConfig>,
     miner_key: MinerKey,
     rpc: Arc<RpcClient>,
     ledger: Arc<Ledger>,
@@ -410,6 +459,34 @@ async fn serve_miner(
             return Ok(());
         }
     };
+    // Vardiff: size the channel's initial target from the miner's
+    // declared `nominal_hash_rate_bits` (a Hz value packed as f32 bits),
+    // aiming for ~1 share per `target_interval_secs`. If the miner
+    // reports a 0 / NaN / negative rate, or vardiff is disabled, fall
+    // back to the pool default.
+    let initial_share_target = match vardiff {
+        Some(cfg) => {
+            let rate_hps = f32::from_bits(open.nominal_hash_rate_bits) as f64;
+            let t = target_for_hashrate(rate_hps, cfg.target_interval_secs);
+            // Clamp: never give a channel an EASIER target than the
+            // pool's default fallback. A miner reporting 0 hashrate
+            // shouldn't get an "every hash is a share" target.
+            if t > share_target_fallback {
+                share_target_fallback
+            } else {
+                t
+            }
+        }
+        None => share_target_fallback,
+    };
+    let mut share_target = initial_share_target;
+    info!(
+        channel_id,
+        nominal_hps = f32::from_bits(open.nominal_hash_rate_bits),
+        vardiff = vardiff.is_some(),
+        initial_target = %hex::encode(initial_share_target),
+        "channel-open vardiff sizing",
+    );
     // Miner's max_target must be ≥ the pool's assigned share target;
     // otherwise the miner's hardware can't produce shares we'd accept.
     if open.max_target < share_target {
@@ -451,6 +528,22 @@ async fn serve_miner(
         current = Some(pt);
     }
 
+    // Vardiff measurement: count accepted shares since the last
+    // retarget tick, recompute observed rate, emit MSG_SET_TARGET if
+    // the new sizing is materially different from the current target.
+    // Disabled when `vardiff.window` is None or vardiff itself is None.
+    let mut accepted_in_window: u64 = 0;
+    let mut window_start = std::time::Instant::now();
+    let vardiff_window = vardiff.and_then(|v| v.window);
+    let mut vardiff_tick = vardiff_window
+        .map(|w| {
+            let mut t = tokio::time::interval(w);
+            t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // First tick fires immediately; consume it so we wait a
+            // full window before our first measurement.
+            t
+        });
+
     loop {
         tokio::select! {
             biased;
@@ -463,6 +556,74 @@ async fn serve_miner(
                 if let Some(pt) = maybe_t {
                     push_job(&mut session, channel_id, &pt).await?;
                     current = Some(pt);
+                }
+            }
+
+            // Vardiff retargeting: only armed when configured. Sized so
+            // the next-emitted target produces ~1 share / target_interval
+            // at the OBSERVED rate (smoothed against the last setting).
+            _ = async {
+                match vardiff_tick.as_mut() {
+                    Some(t) => { t.tick().await; }
+                    None => std::future::pending::<()>().await,
+                }
+            }, if vardiff_tick.is_some() => {
+                if let Some(cfg) = vardiff {
+                    let elapsed = window_start.elapsed().as_secs_f64().max(0.001);
+                    let observed_share_rate = accepted_in_window as f64 / elapsed;
+                    if observed_share_rate > 0.0 {
+                        // observed_share_rate (shares/sec) under the CURRENT
+                        // target T means hashrate ≈ shares/sec × 2²⁵⁶ / T,
+                        // and a ~1-share-per-interval target needs hashrate
+                        // × interval. Easier to express in terms of the
+                        // current target shape: new_target = current_target ×
+                        // (shares observed) / (shares we wanted).
+                        //
+                        // But we already track hashrate via the miner's
+                        // declared `nominal_hash_rate_bits` at open. After
+                        // one window we have a much better number:
+                        //   hashrate = (shares × 2²⁵⁶ / current_target) /
+                        //              elapsed
+                        // For the leading-zero-target shape, that simplifies
+                        // to a small integer adjustment in `bits`. Recompute
+                        // from observed rate directly via `target_for_hashrate`.
+                        let leading_zero_bits_in_current =
+                            count_leading_zero_bits(&share_target) as f64;
+                        let work_per_share = 2f64.powf(leading_zero_bits_in_current);
+                        let inferred_hashrate = observed_share_rate * work_per_share;
+                        let new_target = target_for_hashrate(
+                            inferred_hashrate,
+                            cfg.target_interval_secs,
+                        );
+                        // Clamp easier-than-fallback (paranoia).
+                        let new_target = if new_target > share_target_fallback {
+                            share_target_fallback
+                        } else {
+                            new_target
+                        };
+                        if new_target != share_target {
+                            info!(
+                                channel_id,
+                                accepted_in_window,
+                                window_secs = elapsed,
+                                observed_rate_per_sec = observed_share_rate,
+                                inferred_hashrate_hps = inferred_hashrate,
+                                new_target = %hex::encode(new_target),
+                                old_target = %hex::encode(share_target),
+                                "vardiff retarget"
+                            );
+                            share_target = new_target;
+                            let payload = encode_set_target(
+                                &dinero_sv2_common::SetTarget {
+                                    channel_id,
+                                    max_target: share_target,
+                                },
+                            );
+                            session.write_frame(MSG_SET_TARGET, &payload).await?;
+                        }
+                    }
+                    accepted_in_window = 0;
+                    window_start = std::time::Instant::now();
                 }
             }
 
@@ -481,6 +642,7 @@ async fn serve_miner(
                             share_target,
                             channel_id,
                             &mut last_sequence_number,
+                            &mut accepted_in_window,
                             miner_key,
                             rpc.as_ref(),
                             ledger.as_ref(),
@@ -495,6 +657,7 @@ async fn serve_miner(
                             share_target,
                             channel_id,
                             &mut last_sequence_number,
+                            &mut accepted_in_window,
                             miner_key,
                             rpc.as_ref(),
                             ledger.as_ref(),
@@ -573,6 +736,7 @@ async fn handle_share(
     share_target: [u8; 32],
     channel_id: u32,
     last_sequence_number: &mut u32,
+    accepted_in_window: &mut u64,
     miner_key: MinerKey,
     rpc: &RpcClient,
     ledger: &Ledger,
@@ -627,6 +791,7 @@ async fn handle_share(
     }
 
     ledger.credit_share(miner_key);
+    *accepted_in_window += 1;
     info!(
         hash = %hex::encode(hash),
         template_id = pt.wire.template_id,
@@ -693,6 +858,7 @@ async fn handle_extended_share(
     share_target: [u8; 32],
     channel_id: u32,
     last_sequence_number: &mut u32,
+    accepted_in_window: &mut u64,
     miner_key: MinerKey,
     rpc: &RpcClient,
     ledger: &Ledger,
@@ -835,6 +1001,7 @@ async fn handle_extended_share(
     }
 
     ledger.credit_share(miner_key);
+    *accepted_in_window += 1;
     info!(
         hash = %hex::encode(hash),
         template_id = pt.wire.template_id,
@@ -925,4 +1092,23 @@ fn wrap_stripped_with_segwit_witness(
     out.extend_from_slice(witness_bytes); // witness stacks
     out.extend_from_slice(&stripped[mid_end..]); // locktime
     out
+}
+
+/// Count leading zero bits in a 32-byte big-endian target. Used to
+/// estimate the miner's effective hashrate from observed share count
+/// under the current target shape (which is always `0..0 1..1` from
+/// `leading_zero_bits_target`). For a non-leading-zero-shape target
+/// this is just an approximation, but the vardiff loop only ever
+/// produces leading-zero-shape targets so the cycle is consistent.
+fn count_leading_zero_bits(target: &[u8; 32]) -> u32 {
+    let mut bits = 0u32;
+    for byte in target {
+        if *byte == 0 {
+            bits += 8;
+        } else {
+            bits += byte.leading_zeros();
+            break;
+        }
+    }
+    bits
 }

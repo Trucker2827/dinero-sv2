@@ -17,9 +17,9 @@ pub mod sv2_messages;
 
 pub use sv2_messages::{
     CoinbaseContext, CoinbaseOutputWire, OpenStandardMiningChannel, OpenStandardMiningChannelError,
-    OpenStandardMiningChannelSuccess, SetNewPrevHash, SetupConnection, SetupConnectionError,
-    SetupConnectionSuccess, SubmitSharesError, SubmitSharesExtendedDinero, SubmitSharesSuccess,
-    PROTOCOL_MINING, PROTOCOL_VERSION,
+    OpenStandardMiningChannelSuccess, SetNewPrevHash, SetTarget, SetupConnection,
+    SetupConnectionError, SetupConnectionSuccess, SubmitSharesError, SubmitSharesExtendedDinero,
+    SubmitSharesSuccess, PROTOCOL_MINING, PROTOCOL_VERSION,
 };
 
 use sha2::{Digest, Sha256};

@@ -15,13 +15,14 @@ pub mod sv2;
 pub use sv2::{
     decode_coinbase_context, decode_open_standard_mining_channel,
     decode_open_standard_mining_channel_error, decode_open_standard_mining_channel_success,
-    decode_set_new_prev_hash, decode_setup_connection, decode_setup_connection_error,
-    decode_setup_connection_success, decode_submit_shares_error, decode_submit_shares_extended,
-    decode_submit_shares_success, encode_coinbase_context, encode_open_standard_mining_channel,
-    encode_open_standard_mining_channel_error, encode_open_standard_mining_channel_success,
-    encode_set_new_prev_hash, encode_setup_connection, encode_setup_connection_error,
-    encode_setup_connection_success, encode_submit_shares_error, encode_submit_shares_extended,
-    encode_submit_shares_success, Sv2CodecError,
+    decode_set_new_prev_hash, decode_set_target, decode_setup_connection,
+    decode_setup_connection_error, decode_setup_connection_success, decode_submit_shares_error,
+    decode_submit_shares_extended, decode_submit_shares_success, encode_coinbase_context,
+    encode_open_standard_mining_channel, encode_open_standard_mining_channel_error,
+    encode_open_standard_mining_channel_success, encode_set_new_prev_hash, encode_set_target,
+    encode_setup_connection, encode_setup_connection_error, encode_setup_connection_success,
+    encode_submit_shares_error, encode_submit_shares_extended, encode_submit_shares_success,
+    Sv2CodecError,
 };
 
 use dinero_sv2_common::{NewTemplateDinero, SubmitSharesDinero};

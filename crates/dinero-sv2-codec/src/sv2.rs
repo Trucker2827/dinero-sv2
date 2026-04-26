@@ -9,8 +9,9 @@
 
 use dinero_sv2_common::{
     CoinbaseContext, CoinbaseOutputWire, OpenStandardMiningChannel, OpenStandardMiningChannelError,
-    OpenStandardMiningChannelSuccess, SetNewPrevHash, SetupConnection, SetupConnectionError,
-    SetupConnectionSuccess, SubmitSharesError, SubmitSharesExtendedDinero, SubmitSharesSuccess,
+    OpenStandardMiningChannelSuccess, SetNewPrevHash, SetTarget, SetupConnection,
+    SetupConnectionError, SetupConnectionSuccess, SubmitSharesError, SubmitSharesExtendedDinero,
+    SubmitSharesSuccess,
 };
 
 /// Variable-field caps (Phase 5).
@@ -205,6 +206,28 @@ pub fn decode_open_standard_mining_channel_error(
     Ok(OpenStandardMiningChannelError {
         request_id,
         error_code,
+    })
+}
+
+// ------------------------------ SetTarget ------------------------------
+
+/// Encode a [`SetTarget`] message: `channel_id (u32 LE) || max_target (32 BE)`.
+pub fn encode_set_target(msg: &SetTarget) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + 32);
+    out.extend_from_slice(&msg.channel_id.to_le_bytes());
+    out.extend_from_slice(&msg.max_target);
+    out
+}
+
+/// Decode a [`SetTarget`] message.
+pub fn decode_set_target(buf: &[u8]) -> Result<SetTarget, Sv2CodecError> {
+    let mut cur = Cursor::new(buf);
+    let channel_id = cur.read_u32()?;
+    let max_target = cur.read_array32()?;
+    cur.finish()?;
+    Ok(SetTarget {
+        channel_id,
+        max_target,
     })
 }
 
@@ -678,6 +701,31 @@ mod tests {
             m,
             decode_open_standard_mining_channel_error(&bytes).unwrap()
         );
+    }
+
+    #[test]
+    fn set_target_roundtrip() {
+        let mut t = [0u8; 32];
+        t[0] = 0x00;
+        t[1] = 0x00;
+        t[2] = 0x0F; // ~28 leading zero bits — typical vardiff target
+        let m = SetTarget {
+            channel_id: 7,
+            max_target: t,
+        };
+        let bytes = encode_set_target(&m);
+        assert_eq!(bytes.len(), 4 + 32);
+        assert_eq!(m, decode_set_target(&bytes).unwrap());
+    }
+
+    #[test]
+    fn set_target_rejects_trailing() {
+        let mut buf = encode_set_target(&SetTarget {
+            channel_id: 1,
+            max_target: [0; 32],
+        });
+        buf.push(0x00);
+        assert!(decode_set_target(&buf).is_err());
     }
 
     #[test]

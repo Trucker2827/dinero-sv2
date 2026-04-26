@@ -12,9 +12,9 @@ use anyhow::{bail, Context, Result};
 use clap::Parser;
 use dinero_sv2_codec::{
     decode_coinbase_context, decode_new_template, decode_open_standard_mining_channel_success,
-    decode_set_new_prev_hash, decode_setup_connection_success, decode_submit_shares_error,
-    decode_submit_shares_success, encode_open_standard_mining_channel, encode_setup_connection,
-    encode_submit_shares_extended,
+    decode_set_new_prev_hash, decode_set_target, decode_setup_connection_success,
+    decode_submit_shares_error, decode_submit_shares_success, encode_open_standard_mining_channel,
+    encode_setup_connection, encode_submit_shares_extended,
 };
 use dinero_sv2_common::{
     CoinbaseContext, CoinbaseOutputWire, HeaderAssembly, NewTemplateDinero,
@@ -32,7 +32,7 @@ use dinero_sv2_transport::{
     Frame, NoiseReader, NoiseSession, MSG_COINBASE_CONTEXT, MSG_NEW_MINING_JOB,
     MSG_OPEN_STANDARD_MINING_CHANNEL, MSG_OPEN_STANDARD_MINING_CHANNEL_ERROR,
     MSG_OPEN_STANDARD_MINING_CHANNEL_SUCCESS, MSG_SETUP_CONNECTION, MSG_SETUP_CONNECTION_ERROR,
-    MSG_SETUP_CONNECTION_SUCCESS, MSG_SET_NEW_PREV_HASH, MSG_SUBMIT_SHARES_ERROR,
+    MSG_SETUP_CONNECTION_SUCCESS, MSG_SET_NEW_PREV_HASH, MSG_SET_TARGET, MSG_SUBMIT_SHARES_ERROR,
     MSG_SUBMIT_SHARES_EXTENDED, MSG_SUBMIT_SHARES_SUCCESS, MSG_UTREEXO_STATE,
 };
 use rayon::prelude::*;
@@ -270,7 +270,7 @@ async fn run_session(
             &encode_open_standard_mining_channel(&open)?,
         )
         .await?;
-    let (channel_id, share_target) = expect_channel_open(&mut reader).await?;
+    let (channel_id, mut share_target) = expect_channel_open(&mut reader).await?;
     emitter.emit(
         "channel_open",
         &serde_json::json!({
@@ -382,6 +382,22 @@ async fn run_session(
                                 "error": String::from_utf8_lossy(&e.error_code).to_string(),
                             }),
                         );
+                    }
+                    MSG_SET_TARGET => {
+                        let st = decode_set_target(&frame.payload)?;
+                        emitter.emit(
+                            "set_target",
+                            &serde_json::json!({
+                                "channel_id": st.channel_id,
+                                "max_target": hex::encode(st.max_target),
+                            }),
+                        );
+                        // Update local target. Bump generation so any
+                        // in-flight rayon workers exit; the next
+                        // NewMiningJob will respawn with the new target
+                        // baked in.
+                        share_target = st.max_target;
+                        generation.fetch_add(1, Ordering::SeqCst);
                     }
                     other => {
                         tracing::debug!("unhandled frame msg_type=0x{:02x}", other);

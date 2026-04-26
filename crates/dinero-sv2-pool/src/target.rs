@@ -44,6 +44,42 @@ pub fn hash_meets_target(hash: &[u8; 32], target: &[u8; 32]) -> bool {
     hash < target
 }
 
+/// Size a share target so a miner running at `hashrate_hps` produces
+/// approximately one accepted share every `target_share_interval_secs`.
+///
+/// Math: P(hash ≤ T) = T / 2²⁵⁶, so expected hashes-per-share is
+/// 2²⁵⁶ / T. We want hashes-per-share = hashrate × interval, so
+/// T = 2²⁵⁶ / (hashrate × interval). Rather than build a 256-bit
+/// arithmetic library, we compute the target's leading-zero bit count
+/// — log2(hashrate × interval), rounded — and map it to the
+/// `0..0 1..1` shape returned by [`leading_zero_bits_target`].
+///
+/// Clamp behaviour:
+/// - non-finite or non-positive hashrate / interval → `0xFF…FF` (every
+///   hash accepted; pool falls back to default sizing)
+/// - hashrate × interval ≤ 1 → `0xFF…FF` (no extra zero bits required)
+/// - log2 ≥ 256 → `0x00…00` (impossible target; clamps absurd input)
+pub fn target_for_hashrate(hashrate_hps: f64, target_share_interval_secs: f64) -> [u8; 32] {
+    if !hashrate_hps.is_finite() || hashrate_hps <= 0.0 {
+        return [0xFFu8; 32];
+    }
+    if !target_share_interval_secs.is_finite() || target_share_interval_secs <= 0.0 {
+        return [0xFFu8; 32];
+    }
+    let work_per_share = hashrate_hps * target_share_interval_secs;
+    if work_per_share <= 1.0 {
+        return [0xFFu8; 32];
+    }
+    let bits = work_per_share.log2().round() as i64;
+    if bits <= 0 {
+        [0xFFu8; 32]
+    } else if bits >= 256 {
+        [0u8; 32]
+    } else {
+        leading_zero_bits_target(bits as u32)
+    }
+}
+
 /// Convenience: derive a "leading zero bits" target for share difficulty.
 ///
 /// Returns a target where the top `bits` bits are zero and all lower

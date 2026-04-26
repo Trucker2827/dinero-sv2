@@ -62,6 +62,14 @@ pub const MSG_SET_NEW_PREV_HASH: u8 = 0x20;
 /// [`MSG_NEW_MINING_JOB`].
 pub const MSG_UTREEXO_STATE: u8 = 0x21;
 
+/// Mining: `SetTarget` — pool retargets a channel's share difficulty
+/// at runtime. Carries the new 32-byte big-endian `max_target` for the
+/// given `channel_id`. Forward-compatible: clients that don't recognise
+/// this msg type log "unexpected frame type" and keep mining at their
+/// existing target. Used by pool-side vardiff to size targets to the
+/// miner's actual hashrate (~1 share / 5 s).
+pub const MSG_SET_TARGET: u8 = 0x22;
+
 /// Mining (Dinero extension): `CoinbaseContext` — coinbase prefix +
 /// suffix + merkle path + height + value. Sent between
 /// [`MSG_UTREEXO_STATE`] and [`MSG_NEW_MINING_JOB`] on JD-capable

@@ -218,6 +218,23 @@ pub struct CoinbaseOutputWire {
     pub script_pubkey: Vec<u8>,
 }
 
+/// Pool → miner: retarget the channel's share difficulty.
+///
+/// Used by pool-side vardiff. The pool sizes `max_target` to the miner's
+/// reported / measured hashrate so the miner produces ~1 share / 5 sec —
+/// frequent enough to feel responsive in a UI, sparse enough to avoid
+/// flooding the pool with shares from a fast GPU. Forward-compatible:
+/// pre-vardiff clients that don't recognise the `MSG_SET_TARGET` opcode
+/// log "unexpected frame type" and keep mining at their channel-open
+/// target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetTarget {
+    /// Channel the new target applies to.
+    pub channel_id: u32,
+    /// New 32-byte big-endian max_target. Hash ≤ this is a credited share.
+    pub max_target: [u8; 32],
+}
+
 /// Pool → miner: tip changed.
 ///
 /// Sent *before* the next `NewMiningJob`. Miners MUST treat any
