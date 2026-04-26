@@ -17,6 +17,7 @@ use dinero_sv2_pool::{accounting, block, mapper, rpc, target};
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -157,6 +158,10 @@ async fn main() -> Result<()> {
 
     let share_target = leading_zero_bits_target(args.share_leading_bits);
     let ledger = Arc::new(Ledger::default());
+    // Per-connection channel id allocator. Channel 1 is reserved as the
+    // historical default; new connections take 2, 3, … so pool logs and
+    // future SetTarget routing can disambiguate miners on the wire.
+    let next_channel_id = Arc::new(AtomicU32::new(2));
 
     let (tx, rx) = watch::channel::<Option<PoolTemplate>>(None);
 
@@ -259,8 +264,9 @@ async fn main() -> Result<()> {
         let ledger = ledger.clone();
         let share_target_copy = share_target;
         let keys = static_keys.clone();
+        let channel_id = next_channel_id.fetch_add(1, Ordering::Relaxed);
         tokio::spawn(async move {
-            info!(%peer, "miner connected — handshake starting");
+            info!(%peer, channel_id, "miner connected — handshake starting");
             let session = match NoiseSession::accept_nx(sock, &keys).await {
                 Ok(s) => s,
                 Err(e) => {
@@ -269,13 +275,21 @@ async fn main() -> Result<()> {
                 }
             };
             let miner_key = session.peer_static_key();
-            info!(%peer, miner = %hex::encode(miner_key), "noise handshake complete");
-            if let Err(e) =
-                serve_miner(session, rx, share_target_copy, miner_key, rpc, ledger).await
+            info!(%peer, channel_id, miner = %hex::encode(miner_key), "noise handshake complete");
+            if let Err(e) = serve_miner(
+                session,
+                rx,
+                share_target_copy,
+                miner_key,
+                rpc,
+                ledger,
+                channel_id,
+            )
+            .await
             {
-                warn!(%peer, error = %e, "miner session ended with error");
+                warn!(%peer, channel_id, error = %e, "miner session ended with error");
             } else {
-                info!(%peer, "miner disconnected");
+                info!(%peer, channel_id, "miner disconnected");
             }
         });
     }
@@ -291,10 +305,6 @@ fn default_pool_key_path() -> PathBuf {
     PathBuf::from(format!("{home}/.dinero/dinero-sv2-pool.key"))
 }
 
-/// Pool-assigned channel id for the single channel per connection that
-/// Pass B supports. Real multi-channel bookkeeping is Pass C material.
-const DEFAULT_CHANNEL_ID: u32 = 1;
-
 async fn serve_miner(
     mut session: NoiseSession<TcpStream>,
     mut rx: watch::Receiver<Option<PoolTemplate>>,
@@ -302,6 +312,7 @@ async fn serve_miner(
     miner_key: MinerKey,
     rpc: Arc<RpcClient>,
     ledger: Arc<Ledger>,
+    channel_id: u32,
 ) -> Result<()> {
     // ---- Phase A: SetupConnection ----
     let f = session
@@ -412,7 +423,6 @@ async fn serve_miner(
             .await?;
         return Ok(());
     }
-    let channel_id = DEFAULT_CHANNEL_ID;
     session
         .write_frame(
             MSG_OPEN_STANDARD_MINING_CHANNEL_SUCCESS,

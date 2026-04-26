@@ -121,9 +121,18 @@ async fn async_main() -> Result<()> {
     let emitter = Emitter::new(args.json);
     emitter.emit_startup(&args, threads);
 
+    // Process-wide generation counter. Lives across reconnects so that
+    // hashing/telemetry threads spawned in a previous session observe a
+    // bump when the next session starts and exit cleanly. Without this,
+    // a fresh `generation` Arc per session left old workers hashing
+    // forever (especially after the timestamp-wrap fix made them
+    // immortal within their range), each spawning their own telemetry
+    // thread that emitted spurious mhs:0 alongside the real ones.
+    let generation = Arc::new(AtomicU64::new(0));
+
     let mut blocks_found: u64 = 0;
     loop {
-        match run_session(&args, pinned.as_ref(), &payout_script, threads, &emitter).await {
+        match run_session(&args, pinned.as_ref(), &payout_script, threads, Arc::clone(&generation), &emitter).await {
             Ok(round_blocks) => {
                 blocks_found += round_blocks;
                 if args.max_blocks > 0 && blocks_found >= args.max_blocks {
@@ -185,6 +194,7 @@ async fn run_session(
     pinned: Option<&[u8; 32]>,
     payout_script: &[u8],
     threads: usize,
+    generation: Arc<AtomicU64>,
     emitter: &Emitter,
 ) -> Result<u64> {
     let tcp = TcpStream::connect(args.pool).await.context("connect")?;
@@ -263,7 +273,6 @@ async fn run_session(
     let mut seq: u32 = 0;
 
     let cancel = Arc::new(AtomicBool::new(false));
-    let generation = Arc::new(AtomicU64::new(0));
     let (share_tx, mut share_rx) = mpsc::unbounded_channel::<FoundShare>();
 
     let result: Result<u64> = loop {
@@ -387,6 +396,10 @@ async fn run_session(
     };
 
     reader_task.abort();
+    // Bump generation so any hashing/telemetry threads still alive from
+    // this session see they're stale and exit before the next session
+    // (or the same one, on reconnect) spawns fresh workers.
+    generation.fetch_add(1, Ordering::SeqCst);
     result
 }
 
@@ -540,28 +553,38 @@ fn start_hashing(
     let tmpl_id = tmpl.template_id;
 
     // Shared hash counter + a telemetry thread that reports the rolling
-    // hashrate as a JSON event every 2 seconds. Sibling of the GPU
-    // miner's hashrate event so Qt can treat both backends uniformly.
+    // hashrate via the structured emitter every 2 seconds. Sibling of the
+    // GPU miner's hashrate event so Qt can treat both backends uniformly.
+    // Both this thread and the rayon workers below exit when they observe
+    // a generation bump — that's the single cancellation signal, replacing
+    // the bool flag (which had a clear-before-observe race and orphaned
+    // telemetry threads on same-tip refresh, each spamming `mhs:0`).
     let hashes_done = Arc::new(AtomicU64::new(0));
     {
         let hashes = Arc::clone(&hashes_done);
-        let cancel_telemetry = Arc::clone(&cancel);
+        let global_generation = Arc::clone(&generation);
+        let gen_at_spawn = gen;
+        let emitter = emitter.clone();
         std::thread::spawn(move || {
             let mut last = 0u64;
             let mut last_instant = Instant::now();
             loop {
                 std::thread::sleep(Duration::from_secs(2));
-                if cancel_telemetry.load(Ordering::Relaxed) {
+                if global_generation.load(Ordering::Relaxed) > gen_at_spawn {
                     return;
                 }
                 let now = hashes.load(Ordering::Relaxed);
                 let dt = last_instant.elapsed().as_secs_f64();
                 let delta = now.saturating_sub(last);
                 let mhs = (delta as f64 / dt) / 1e6;
-                // JSON event on stdout so the Qt frontend can parse it.
-                println!(
-                    "{{\"event\":\"hashrate\",\"mhs\":{:.2},\"hashes_since_last\":{},\"interval_s\":{:.2},\"backend\":\"cpu\"}}",
-                    mhs, delta, dt,
+                emitter.emit(
+                    "hashrate",
+                    &serde_json::json!({
+                        "mhs": (mhs * 100.0).round() / 100.0,
+                        "hashes_since_last": delta,
+                        "interval_s": (dt * 100.0).round() / 100.0,
+                        "backend": "cpu",
+                    }),
                 );
                 last = now;
                 last_instant = Instant::now();
@@ -569,6 +592,7 @@ fn start_hashing(
         });
     }
 
+    let global_generation = Arc::clone(&generation);
     std::thread::spawn(move || {
         let per_thread = (u32::MAX as u64 + 1) / (threads.max(1) as u64);
         let mut ranges: Vec<(u32, u32)> = Vec::with_capacity(threads);
@@ -584,50 +608,80 @@ fn start_hashing(
             cursor += per_thread;
         }
 
+        // Per-rayon-worker:
+        //   outer loop  : bump local timestamp when the assigned range exhausts
+        //   inner loop  : sweep [start, end] at the current timestamp
+        // Each share carries its own timestamp on the wire, so different
+        // workers running at different timestamps doesn't desync the pool —
+        // it just means we explore a wider (timestamp, nonce) plane in
+        // parallel, identical in spirit to the GPU miner's wrap fix.
         ranges.par_iter().for_each(|(start, end)| {
-            let mut tries: u64 = 0;
             let mut local_hashes: u64 = 0;
-            let mut nonce = *start;
-            loop {
-                if cancel.load(Ordering::Relaxed) {
+            let mut current_timestamp: u64 = tmpl_timestamp;
+            'outer: loop {
+                if global_generation.load(Ordering::Relaxed) > gen {
                     hashes_done.fetch_add(local_hashes, Ordering::Relaxed);
                     return;
                 }
-                if tries & 0xFFFFF == 0 && tries > 0 {
-                    hashes_done.fetch_add(local_hashes, Ordering::Relaxed);
-                    local_hashes = 0;
+                let mut nonce = *start;
+                let mut tries: u64 = 0;
+                loop {
+                    if global_generation.load(Ordering::Relaxed) > gen {
+                        hashes_done.fetch_add(local_hashes, Ordering::Relaxed);
+                        return;
+                    }
+                    if tries & 0xFFFFF == 0 && tries > 0 {
+                        hashes_done.fetch_add(local_hashes, Ordering::Relaxed);
+                        local_hashes = 0;
+                    }
+
+                    let share = SubmitSharesDinero {
+                        channel_id: 0,
+                        sequence_number: 0,
+                        job_id: 0,
+                        nonce,
+                        timestamp: current_timestamp,
+                        version: tmpl_version,
+                    };
+                    let hash = HeaderAssembly::hash(&our_template, &share);
+                    local_hashes += 1;
+                    if hash < share_target {
+                        let meets_block = hash < block_target;
+                        let _ = share_tx.send(FoundShare {
+                            generation: gen,
+                            template_id: tmpl_id,
+                            timestamp: current_timestamp,
+                            version: tmpl_version,
+                            nonce,
+                            hash,
+                            meets_block_target: meets_block,
+                            tries,
+                            coinbase_outputs: coinbase_outputs_wire.clone(),
+                        });
+                    }
+                    tries += 1;
+                    if nonce == *end {
+                        hashes_done.fetch_add(local_hashes, Ordering::Relaxed);
+                        local_hashes = 0;
+                        break;
+                    }
+                    nonce = nonce.wrapping_add(1);
                 }
 
-                let share = SubmitSharesDinero {
-                    channel_id: 0,
-                    sequence_number: 0,
-                    job_id: 0,
-                    nonce,
-                    timestamp: tmpl_timestamp,
-                    version: tmpl_version,
-                };
-                let hash = HeaderAssembly::hash(&our_template, &share);
-                local_hashes += 1;
-                if hash < share_target {
-                    let meets_block = hash < block_target;
-                    let _ = share_tx.send(FoundShare {
-                        generation: gen,
-                        template_id: tmpl_id,
-                        timestamp: tmpl_timestamp,
-                        version: tmpl_version,
-                        nonce,
-                        hash,
-                        meets_block_target: meets_block,
-                        tries,
-                        coinbase_outputs: coinbase_outputs_wire.clone(),
-                    });
+                // Bump timestamp and re-sweep this worker's range. Pool
+                // accepts shares with miner-supplied ntime within the
+                // daemon's future-block-time tolerance; capping at +3600 s
+                // matches the GPU miner.
+                current_timestamp = current_timestamp.wrapping_add(1);
+                if current_timestamp.saturating_sub(tmpl_timestamp) > 3600 {
+                    // Overshot the future-time tolerance with no new job —
+                    // park until generation flips.
+                    while global_generation.load(Ordering::Relaxed) == gen {
+                        std::thread::sleep(Duration::from_millis(200));
+                    }
+                    return;
                 }
-                tries += 1;
-                if nonce == *end {
-                    hashes_done.fetch_add(local_hashes, Ordering::Relaxed);
-                    break;
-                }
-                nonce = nonce.wrapping_add(1);
+                continue 'outer;
             }
         });
     });
@@ -657,6 +711,7 @@ fn nbits_to_target(bits: u32) -> [u8; 32] {
 
 // ───── Structured event emitter ─────
 
+#[derive(Clone)]
 struct Emitter {
     json: bool,
 }

@@ -123,9 +123,15 @@ async fn async_main() -> Result<()> {
             }),
         );
 
+        // Process-wide generation counter (lives across reconnects) so
+        // hashing threads from a previous session observe a bump and
+        // exit; otherwise their per-session generation Arc would never
+        // increment and the GPU dispatch thread would run forever.
+        let generation = Arc::new(AtomicU64::new(0));
+
         let mut blocks_found: u64 = 0;
         loop {
-            match run_session(&args, pinned.as_ref(), &payout_script, &gpu, &emitter).await {
+            match run_session(&args, pinned.as_ref(), &payout_script, &gpu, Arc::clone(&generation), &emitter).await {
                 Ok(found) => {
                     blocks_found += found;
                     if args.max_blocks > 0 && blocks_found >= args.max_blocks {
@@ -186,6 +192,7 @@ async fn run_session(
     pinned: Option<&[u8; 32]>,
     payout_script: &[u8],
     gpu: &metal_backend::MetalMiner,
+    generation: Arc<AtomicU64>,
     emitter: &Emitter,
 ) -> Result<u64> {
     let tcp = TcpStream::connect(args.pool).await.context("connect")?;
@@ -256,17 +263,23 @@ async fn run_session(
     let mut blocks_found: u64 = 0;
     let mut seq: u32 = 0;
 
-    let generation = Arc::new(AtomicU64::new(0));
     let (share_tx, mut share_rx) = mpsc::unbounded_channel::<FoundShare>();
 
     // Coalesce share-accept telemetry. With the GPU running at ~500
     // shares/sec, emitting a JSON event per pool ack drowns the Qt UI
     // thread. We collect into a 1-second window and flush a single
-    // summary event per window.
+    // summary event per window. The timer arm in the select! below
+    // forces a flush even when share traffic stops, so the UI doesn't
+    // freeze a half-emitted batch when the pool goes quiet after a burst.
     let mut acc_window_count: u64 = 0;
     let mut acc_window_last_seq: u64 = 0;
+    let mut acc_window_last_channel: u32 = channel_id;
+    let mut acc_window_last_shares_sum: u64 = 0;
     let mut acc_window_started: std::time::Instant = std::time::Instant::now();
     const ACCEPT_FLUSH_MS: u128 = 1000;
+    let mut accept_flush_tick =
+        tokio::time::interval(std::time::Duration::from_millis(ACCEPT_FLUSH_MS as u64));
+    accept_flush_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     let result: Result<u64> = loop {
         tokio::select! {
@@ -330,14 +343,16 @@ async fn run_session(
                         let s = decode_submit_shares_success(&frame.payload)?;
                         acc_window_count += s.new_submits_accepted_count.max(1) as u64;
                         acc_window_last_seq = s.last_sequence_number as u64;
+                        acc_window_last_channel = s.channel_id;
+                        acc_window_last_shares_sum = s.new_shares_sum as u64;
                         if acc_window_started.elapsed().as_millis() >= ACCEPT_FLUSH_MS {
                             emitter.emit(
                                 "share_accepted",
                                 &serde_json::json!({
-                                    "channel_id": s.channel_id,
+                                    "channel_id": acc_window_last_channel,
                                     "last_seq": acc_window_last_seq,
                                     "accepted_count": acc_window_count,
-                                    "shares_sum": s.new_shares_sum,
+                                    "shares_sum": acc_window_last_shares_sum,
                                     "window_ms": acc_window_started.elapsed().as_millis() as u64,
                                 }),
                             );
@@ -403,10 +418,35 @@ async fn run_session(
                     }
                 }
             }
+            _ = accept_flush_tick.tick() => {
+                // Periodic flush: if shares accumulated but the next pool
+                // ack hasn't arrived, emit what we have so the UI counter
+                // tracks the live state instead of freezing on the last
+                // burst's tail.
+                if acc_window_count > 0
+                    && acc_window_started.elapsed().as_millis() >= ACCEPT_FLUSH_MS
+                {
+                    emitter.emit(
+                        "share_accepted",
+                        &serde_json::json!({
+                            "channel_id": acc_window_last_channel,
+                            "last_seq": acc_window_last_seq,
+                            "accepted_count": acc_window_count,
+                            "shares_sum": acc_window_last_shares_sum,
+                            "window_ms": acc_window_started.elapsed().as_millis() as u64,
+                        }),
+                    );
+                    acc_window_count = 0;
+                    acc_window_started = std::time::Instant::now();
+                }
+            }
         }
     };
 
     reader_task.abort();
+    // Bump generation so any GPU dispatch thread still alive from this
+    // session observes it and exits before the next session re-spawns.
+    generation.fetch_add(1, Ordering::SeqCst);
     result
 }
 
@@ -579,7 +619,7 @@ fn start_hashing_gpu(
         const EMIT_INTERVAL_MS: u128 = 1000;
 
         let mut current_timestamp: u64 = tmpl_initial_timestamp;
-        'outer: loop {
+        loop {
             if stale() {
                 return;
             }
@@ -647,11 +687,14 @@ fn start_hashing_gpu(
             current_timestamp = current_timestamp.wrapping_add(1);
             // Sanity bound: don't drift more than ~1 hour past the
             // template-issued timestamp; pool may reject shares that far
-            // in the future. If we hit this we're effectively idle until
-            // a new job arrives — better than dying silently.
+            // in the future. Park here until generation flips so the GPU
+            // doesn't spin re-sweeping the same exhausted (timestamp,
+            // nonce) range; the next NewMiningJob respawns this thread.
             if current_timestamp.saturating_sub(tmpl_initial_timestamp) > 3600 {
-                std::thread::sleep(std::time::Duration::from_millis(100));
-                continue 'outer;
+                while !stale() {
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+                return;
             }
         }
     });
