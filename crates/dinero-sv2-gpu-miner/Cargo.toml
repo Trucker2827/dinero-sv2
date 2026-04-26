@@ -6,7 +6,7 @@ license     = { workspace = true }
 repository  = { workspace = true }
 authors     = { workspace = true }
 rust-version = { workspace = true }
-description = "Dinero Stratum V2 GPU miner — Metal backend for Apple Silicon, SV2 + Job Declaration"
+description = "Dinero Stratum V2 GPU miner — Metal on Apple Silicon, OpenCL on Linux/Windows, SV2 + Job Declaration"
 
 [[bin]]
 name = "dinero-sv2-gpu-miner"
@@ -30,3 +30,9 @@ tracing-subscriber = { workspace = true }
 metal = "0.27"
 objc  = "0.2"
 core-graphics-types = "0.1"
+
+# Linux + Windows GPU backend. `ocl` 0.19 wraps OpenCL 1.2; works on
+# AMD ROCm, NVIDIA, Intel, and Mesa. Tested target: AMD Radeon Pro WX
+# 2100 on the Dell Tower (mining rig from `dinero-solo-miner`).
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+ocl = "0.19"

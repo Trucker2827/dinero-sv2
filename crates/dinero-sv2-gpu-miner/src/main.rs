@@ -48,8 +48,25 @@ use tokio::time::sleep;
 #[cfg(target_os = "macos")]
 mod metal_backend;
 
+#[cfg(not(target_os = "macos"))]
+mod opencl_backend;
+
+// Backend selection: Metal on Apple Silicon, OpenCL elsewhere. Both
+// modules expose the same surface (`init`, `device_name`,
+// `max_threads_per_group`, `dispatch`) so the SV2/JD layer is
+// platform-agnostic.
+#[cfg(target_os = "macos")]
+type GpuMiner = metal_backend::MetalMiner;
+#[cfg(target_os = "macos")]
+const BACKEND_NAME: &str = "metal";
+
+#[cfg(not(target_os = "macos"))]
+type GpuMiner = opencl_backend::OpenClMiner;
+#[cfg(not(target_os = "macos"))]
+const BACKEND_NAME: &str = "opencl";
+
 #[derive(Parser, Clone)]
-#[command(version, about = "Dinero SV2 GPU pool miner (Metal)")]
+#[command(version, about = "Dinero SV2 GPU pool miner (Metal/OpenCL)")]
 struct Args {
     #[arg(long)]
     pool: SocketAddr,
@@ -99,75 +116,70 @@ async fn async_main() -> Result<()> {
     let emitter = Emitter::new(args.json);
     emitter.emit_startup(&args);
 
-    #[cfg(not(target_os = "macos"))]
-    {
-        emitter.emit(
-            "error",
-            &serde_json::json!({
-                "message": "dinero-sv2-gpu-miner currently supports Metal (macOS) only. \
-                            Use dinero-sv2-miner for CPU mining.",
-            }),
-        );
-        return Ok(());
-    }
+    let gpu = GpuMiner::init().context(concat!("gpu init"))?;
+    emitter.emit(
+        "gpu_ready",
+        &serde_json::json!({
+            "device": gpu.device_name(),
+            "max_threads_per_group": gpu.max_threads_per_group(),
+            "batch_size": args.batch_size,
+            "backend": BACKEND_NAME,
+        }),
+    );
 
-    #[cfg(target_os = "macos")]
-    {
-        let gpu = metal_backend::MetalMiner::init().context("metal init")?;
-        emitter.emit(
-            "gpu_ready",
-            &serde_json::json!({
-                "device": gpu.device_name(),
-                "max_threads_per_group": gpu.max_threads_per_group(),
-                "batch_size": args.batch_size,
-            }),
-        );
+    // Process-wide generation counter (lives across reconnects) so
+    // hashing threads from a previous session observe a bump and
+    // exit; otherwise their per-session generation Arc would never
+    // increment and the GPU dispatch thread would run forever.
+    let generation = Arc::new(AtomicU64::new(0));
 
-        // Process-wide generation counter (lives across reconnects) so
-        // hashing threads from a previous session observe a bump and
-        // exit; otherwise their per-session generation Arc would never
-        // increment and the GPU dispatch thread would run forever.
-        let generation = Arc::new(AtomicU64::new(0));
-
-        let mut blocks_found: u64 = 0;
-        loop {
-            match run_session(&args, pinned.as_ref(), &payout_script, &gpu, Arc::clone(&generation), &emitter).await {
-                Ok(found) => {
-                    blocks_found += found;
-                    if args.max_blocks > 0 && blocks_found >= args.max_blocks {
-                        emitter.emit(
-                            "session_end",
-                            &serde_json::json!({"reason": "max-blocks-reached"}),
-                        );
-                        return Ok(());
-                    }
+    let mut blocks_found: u64 = 0;
+    loop {
+        match run_session(
+            &args,
+            pinned.as_ref(),
+            &payout_script,
+            &gpu,
+            Arc::clone(&generation),
+            &emitter,
+        )
+        .await
+        {
+            Ok(found) => {
+                blocks_found += found;
+                if args.max_blocks > 0 && blocks_found >= args.max_blocks {
                     emitter.emit(
                         "session_end",
-                        &serde_json::json!({"reason": "clean-close"}),
+                        &serde_json::json!({"reason": "max-blocks-reached"}),
                     );
+                    return Ok(());
                 }
-                Err(err) => {
-                    emitter.emit(
-                        "session_end",
-                        &serde_json::json!({
-                            "reason": "error",
-                            "error": err.to_string(),
-                        }),
-                    );
-                    if args.reconnect_secs == 0 {
-                        return Err(err);
-                    }
+                emitter.emit(
+                    "session_end",
+                    &serde_json::json!({"reason": "clean-close"}),
+                );
+            }
+            Err(err) => {
+                emitter.emit(
+                    "session_end",
+                    &serde_json::json!({
+                        "reason": "error",
+                        "error": err.to_string(),
+                    }),
+                );
+                if args.reconnect_secs == 0 {
+                    return Err(err);
                 }
             }
-            if args.reconnect_secs == 0 {
-                return Ok(());
-            }
-            emitter.emit(
-                "reconnect_wait",
-                &serde_json::json!({"seconds": args.reconnect_secs}),
-            );
-            sleep(Duration::from_secs(args.reconnect_secs)).await;
         }
+        if args.reconnect_secs == 0 {
+            return Ok(());
+        }
+        emitter.emit(
+            "reconnect_wait",
+            &serde_json::json!({"seconds": args.reconnect_secs}),
+        );
+        sleep(Duration::from_secs(args.reconnect_secs)).await;
     }
 }
 
@@ -186,12 +198,11 @@ fn parse_server_pubkey(hex_opt: Option<&str>) -> Result<Option<[u8; 32]>> {
     }
 }
 
-#[cfg(target_os = "macos")]
 async fn run_session(
     args: &Args,
     pinned: Option<&[u8; 32]>,
     payout_script: &[u8],
-    gpu: &metal_backend::MetalMiner,
+    gpu: &GpuMiner,
     generation: Arc<AtomicU64>,
     emitter: &Emitter,
 ) -> Result<u64> {
@@ -203,7 +214,7 @@ async fn run_session(
         &serde_json::json!({
             "pool": args.pool.to_string(),
             "server_pubkey": peer_pubkey,
-            "backend": "metal",
+            "backend": BACKEND_NAME,
         }),
     );
 
@@ -503,9 +514,10 @@ struct FoundShare {
     coinbase_outputs: Vec<CoinbaseOutputWire>,
 }
 
-/// GPU mining: assemble miner-owned coinbase + header, dispatch Metal
-/// kernel in batches, report found shares via `share_tx`.
-#[cfg(target_os = "macos")]
+/// GPU mining: assemble miner-owned coinbase + header, dispatch the
+/// platform's GPU kernel in batches, report found shares via `share_tx`.
+/// Backend is Metal on macOS, OpenCL on Linux/Windows — selected via
+/// the `GpuMiner` type alias at the top of the file.
 #[allow(clippy::too_many_arguments)]
 fn start_hashing_gpu(
     tmpl: NewTemplateDinero,
@@ -513,7 +525,7 @@ fn start_hashing_gpu(
     ctx: CoinbaseContext,
     payout_script: Vec<u8>,
     share_target: [u8; 32],
-    gpu: metal_backend::MetalMiner,
+    gpu: GpuMiner,
     batch_size: u32,
     generation: Arc<AtomicU64>,
     share_tx: mpsc::UnboundedSender<FoundShare>,
@@ -591,7 +603,7 @@ fn start_hashing_gpu(
             "difficulty_nbits": format!("0x{:08x}", tmpl.difficulty),
             "block_target": hex::encode(block_target),
             "share_target": hex::encode(share_target),
-            "backend": "metal",
+            "backend": BACKEND_NAME,
         }),
     );
 
@@ -643,11 +655,12 @@ fn start_hashing_gpu(
                     let mhs = (hashes_since_emit as f64 / (total_ms_since_emit / 1000.0)) / 1e6;
                     let dispatch_ms = total_ms_since_emit / ((hashes_since_emit as f64) / (batch_size as f64)).max(1.0);
                     println!(
-                        "{{\"event\":\"hashrate\",\"mhs\":{:.2},\"dispatch_ms\":{:.3},\"nonce_start\":\"0x{:08x}\",\"timestamp\":{},\"backend\":\"metal\"}}",
+                        "{{\"event\":\"hashrate\",\"mhs\":{:.2},\"dispatch_ms\":{:.3},\"nonce_start\":\"0x{:08x}\",\"timestamp\":{},\"backend\":\"{}\"}}",
                         mhs,
                         dispatch_ms,
                         nonce_start as u32,
                         current_timestamp,
+                        BACKEND_NAME,
                     );
                     last_emit = std::time::Instant::now();
                     total_ms_since_emit = 0.0;
@@ -759,7 +772,7 @@ impl Emitter {
                 "batch_size": args.batch_size,
                 "user_agent": args.user_agent,
                 "version": env!("CARGO_PKG_VERSION"),
-                "backend": "metal",
+                "backend": BACKEND_NAME,
             }),
         );
     }
