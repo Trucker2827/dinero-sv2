@@ -37,7 +37,9 @@ use dinero_sv2_common::{
 };
 use dinero_sv2_jd::{
     assemble_stripped_coinbase, commitment as utreexo_commitment, compute_root,
-    encode_utreexo_accumulator_state, leaf_hash, CoinbaseOutput,
+    encode_utreexo_accumulator_state,
+    filter_commitment::{is_dnrf_script, requires_filter_commitment},
+    leaf_hash, CoinbaseOutput,
 };
 use dinero_sv2_transport::{
     Frame, NoiseSession, StaticKeys, MSG_COINBASE_CONTEXT, MSG_NEW_MINING_JOB,
@@ -736,6 +738,30 @@ async fn handle_extended_share(
         );
         ledger.reject(miner_key);
         send_share_error(session, channel_id, ext.sequence_number, "value-mismatch").await?;
+        return Ok(());
+    }
+
+    // 1b. Past the DNRF activation height, the coinbase MUST contain at
+    //     least one OP_RETURN output with the DNRF commitment shape.
+    //     Without this, dinerod rejects the block at submitblock and a
+    //     found block is burned. We only validate the script SHAPE here
+    //     (39 bytes, "DNRF" magic, version 0x01); dinerod re-verifies the
+    //     filter_hash payload against the block's actual filter at
+    //     accept-time. A buggy or stale miner client sending zero DNRF
+    //     outputs is exactly the failure mode this guards.
+    if requires_filter_commitment(pt.height as u64)
+        && !ext
+            .coinbase_outputs
+            .iter()
+            .any(|o| is_dnrf_script(&o.script_pubkey))
+    {
+        warn!(
+            height = pt.height,
+            outputs = ext.coinbase_outputs.len(),
+            "extended share: missing DNRF commitment in miner outputs"
+        );
+        ledger.reject(miner_key);
+        send_share_error(session, channel_id, ext.sequence_number, "missing-dnrf").await?;
         return Ok(());
     }
 

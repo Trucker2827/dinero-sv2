@@ -205,11 +205,18 @@ pub fn map_template(gbt: &Value, template_id: u64) -> Result<PoolTemplate> {
         .and_then(Value::as_array)
         .map(Vec::as_slice)
         .unwrap_or(&[]);
+    // Phase 6a: don't bail on mempool txs. Build a coinbase-only block
+    // and skip the rest. Real inclusion needs Utreexo deletion proofs
+    // for mempool tx inputs (so JD miners can recompute the post-tx
+    // accumulator state); dinerod's RPC surface doesn't expose those
+    // yet. Until it does, the pool stays alive but blocks mined here
+    // collect only the coinbase reward, no mempool fees.
     if !tx_list.is_empty() {
-        bail!(
-            "Phase 4 pool cannot handle mempool transactions yet ({} present). \
-             Re-run against a quiet mempool or a fresh regtest.",
-            tx_list.len()
+        tracing::warn!(
+            mempool_tx_count = tx_list.len(),
+            "mempool txs present in GBT — pool building coinbase-only \
+             block (mempool fees skipped). Need dinerod utreexo deletion \
+             proofs to include mempool txs in JD-path blocks."
         );
     }
     let merkle_root = hex_reverse_32(txid_display)?;
